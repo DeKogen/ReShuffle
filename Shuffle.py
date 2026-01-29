@@ -4,6 +4,8 @@ import random
 import asyncio
 from datetime import datetime, timedelta, timezone
 import os
+import re
+from typing import Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -15,11 +17,13 @@ intents.message_content = True
 intents.voice_states = True
 intents.guilds = True
 intents.members = True  # do not forget to enable in Dev Portal
+intents.guild_scheduled_events = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
 # text_channel_id -> shuffle state
 active_shuffles: dict[int, dict] = {}
+triggered_event_occurrences: set[tuple[int, int]] = set()
 
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
 
@@ -48,6 +52,21 @@ async def on_ready():
     except Exception as e:
         print(f'Failed to sync commands: {e}')
 
+    # If any scheduled events are already active, trigger shuffles on startup.
+    for guild in bot.guilds:
+        try:
+            events = await guild.fetch_scheduled_events()
+        except Exception as e:
+            print(f"Failed to fetch scheduled events for {guild.id}: {e}")
+            continue
+
+        for ev in events:
+            if ev.status is discord.EventStatus.active:
+                try:
+                    await trigger_shuffle_for_event(ev)
+                except Exception as e:
+                    print(f"Error auto-triggering shuffle for event {ev.id}: {e}")
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -56,7 +75,83 @@ async def on_message(message: discord.Message):
     await bot.process_commands(message)
 
 
+@bot.event
+async def on_guild_scheduled_event_update(before, after):
+    """Auto-trigger shuffle when a voice scheduled event becomes active."""
+    if after.status is discord.EventStatus.active and before.status is not discord.EventStatus.active:
+        await trigger_shuffle_for_event(after)
+
+
 # -------- Shuffle helpers --------
+
+def normalize_channel_name(name: str) -> str:
+    """Normalize names for matching text channels to voice channels."""
+    name = name.lower().strip()
+    name = name.replace(" ", "-")
+    name = re.sub(r"-+", "-", name)
+    name = re.sub(r"[^a-z0-9-]", "", name)
+    return name.strip("-")
+
+
+def pick_text_channel_for_voice(
+    voice_channel: discord.VoiceChannel,
+) -> Optional[discord.TextChannel]:
+    """
+    Pick a text channel for a voice channel:
+    1) Same category + same (normalized) name
+    2) Same category + first text channel
+    3) System channel, else first guild text channel
+    """
+    category = voice_channel.category
+    if category is not None:
+        voice_key = normalize_channel_name(voice_channel.name)
+        voice_lower = voice_channel.name.lower()
+
+        for text_ch in category.text_channels:
+            if text_ch.name == voice_lower or text_ch.name == voice_key:
+                return text_ch
+
+        if category.text_channels:
+            return category.text_channels[0]
+
+    guild = voice_channel.guild
+    if guild.system_channel is not None:
+        return guild.system_channel
+
+    if guild.text_channels:
+        return guild.text_channels[0]
+
+    return None
+
+
+async def trigger_shuffle_for_event(event: discord.ScheduledEvent) -> None:
+    """Run shuffle once per event occurrence (event_id + start_time)."""
+    if event.entity_type != discord.EntityType.voice:
+        return
+
+    if event.channel_id is None:
+        return
+
+    start_ts = int(event.start_time.timestamp()) if event.start_time else 0
+    key = (event.id, start_ts)
+    if key in triggered_event_occurrences:
+        return
+
+    triggered_event_occurrences.add(key)
+
+    guild = event.guild
+    voice_channel = guild.get_channel(event.channel_id)
+    if not isinstance(voice_channel, discord.VoiceChannel):
+        print(f"Event {event.id} has no valid voice channel")
+        return
+
+    text_channel = pick_text_channel_for_voice(voice_channel)
+    if text_channel is None:
+        print(f"No text channel found for voice channel {voice_channel.id}")
+        return
+
+    await start_shuffle_for_channel(guild, voice_channel, text_channel)
+
 
 def build_content(guild: discord.Guild, order, labels=None) -> str:
     """Build the visual text of the shuffled list, using custom labels if present."""
@@ -289,17 +384,18 @@ async def create_scheduled_shuffle_event(
     # Human-friendly time output using Discord timestamp tags
     start_ts = int(start_time.timestamp())
     end_ts = int(end_time.timestamp())
+    linked_text_channel = pick_text_channel_for_voice(voice_channel)
+    shuffle_target = linked_text_channel or text_channel
+    shuffle_target_name = getattr(shuffle_target, "mention", "#unknown")
     await text_channel.send(
         f"📅 Scheduled event **{event.name}**\n"
         f"Starts: <t:{start_ts}:F>\n"
         f"Ends:   <t:{end_ts}:F>\n"
         f"Voice channel: {voice_channel.mention}\n"
-        f"Shuffle will auto-run here: {getattr(text_channel, 'mention', '#unknown')}"
+        f"Shuffle will auto-run here: {shuffle_target_name}"
     )
 
     guild_id = guild.id
-    voice_channel_id = voice_channel.id
-    text_channel_id = text_channel.id if isinstance(text_channel, discord.TextChannel) else None
     event_id = event.id
 
     async def auto_start_and_complete():
@@ -330,17 +426,11 @@ async def create_scheduled_shuffle_event(
             except Exception as e:
                 print(f"Error auto-activating event: {e}")
 
-        # Run shuffle in the specified text channel
-        voice_ch = guild_obj.get_channel(voice_channel_id)
-        text_ch = guild_obj.get_channel(text_channel_id) if text_channel_id else None
-
-        if isinstance(voice_ch, discord.VoiceChannel) and text_ch is not None:
-            try:
-                await start_shuffle_for_channel(guild_obj, voice_ch, text_ch)
-            except Exception as e:
-                print(f"Error running auto-shuffle: {e}")
-        else:
-            print("Voice or text channel not found for auto-shuffle")
+        # Run shuffle for this event occurrence
+        try:
+            await trigger_shuffle_for_event(ev or event)
+        except Exception as e:
+            print(f"Error running auto-shuffle: {e}")
 
         # ---- EVENT END ----
         await discord.utils.sleep_until(end_time)
@@ -590,16 +680,18 @@ async def attach_event(ctx: commands.Context, event_id: str):
     if end_time is None:
         end_time = start_time + timedelta(hours=2)
 
+    linked_text_channel = pick_text_channel_for_voice(voice_channel)
+    shuffle_target = linked_text_channel or ctx.channel
+
     await ctx.send(
         f"Attached to event **{event.name}** (`{event.id}`).\n"
         f"Status: `{event.status.name}`\n"
         f"Starts: <t:{int(start_time.timestamp())}:F>\n"
         f"Ends:   <t:{int(end_time.timestamp())}:F>\n\n"
-        f"Shuffle will run in {ctx.channel.mention} "
+        f"Shuffle will run in {shuffle_target.mention} "
         f"for **this upcoming occurrence**."
     )
 
-    text_channel_id = ctx.channel.id
     guild_id = guild.id
 
     async def auto_start_and_complete_existing():
@@ -628,17 +720,11 @@ async def attach_event(ctx: commands.Context, event_id: str):
         except Exception as e:
             print(f"[attach_event] Error auto-activating event: {e}")
 
-        # Run shuffle in the channel where the command was used
-        voice_ch = guild_obj.get_channel(event.channel_id)
-        text_ch = guild_obj.get_channel(text_channel_id)
-
-        if isinstance(voice_ch, discord.VoiceChannel) and isinstance(text_ch, discord.TextChannel):
-            try:
-                await start_shuffle_for_channel(guild_obj, voice_ch, text_ch)
-            except Exception as e:
-                print(f"[attach_event] Error running shuffle: {e}")
-        else:
-            print("[attach_event] Voice or text channel not found for shuffle")
+        # Run shuffle for this event occurrence
+        try:
+            await trigger_shuffle_for_event(ev)
+        except Exception as e:
+            print(f"[attach_event] Error running shuffle: {e}")
 
         # ---- HANDLE END ----
         if end_time > datetime.now(timezone.utc):
