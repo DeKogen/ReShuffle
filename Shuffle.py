@@ -27,8 +27,7 @@ triggered_event_occurrences: set[tuple[int, int]] = set()
 PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
-STARTUP_EVENT_GRACE = timedelta(seconds=30)
-RECENT_SHUFFLE_SCAN_LIMIT = 20
+STARTUP_CLOCK_SKEW = timedelta(seconds=5)
 
 # -------- Role permissions --------
 
@@ -82,6 +81,14 @@ async def on_message(message: discord.Message):
 async def on_guild_scheduled_event_update(before, after):
     """Auto-trigger shuffle when a voice scheduled event becomes active."""
     if after.status is discord.EventStatus.active and before.status is not discord.EventStatus.active:
+        if (
+            after.start_time is not None
+            and after.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
+        ):
+            start_ts = int(after.start_time.timestamp())
+            triggered_event_occurrences.add((after.id, start_ts))
+            print(f"Ignoring scheduled event update for already-started event {after.id}")
+            return
         await trigger_shuffle_for_event(after)
 
 
@@ -152,7 +159,7 @@ async def trigger_shuffle_for_event(
         and
         event.status is discord.EventStatus.active
         and event.start_time is not None
-        and event.start_time < (PROCESS_STARTED_AT - STARTUP_EVENT_GRACE)
+        and event.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
     ):
         triggered_event_occurrences.add(key)
         print(f"Skipping stale active event {event.id} on startup/reconnect")
@@ -177,7 +184,7 @@ async def trigger_shuffle_for_event(
             if event.start_time is not None
             else None
         )
-        async for message in text_channel.history(limit=RECENT_SHUFFLE_SCAN_LIMIT, after=after):
+        async for message in text_channel.history(limit=None, after=after):
             if bot.user is None or message.author.id != bot.user.id:
                 continue
             if message.content.startswith("🎲 **Shuffled list:**"):
