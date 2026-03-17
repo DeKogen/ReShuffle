@@ -24,8 +24,11 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # text_channel_id -> shuffle state
 active_shuffles: dict[int, dict] = {}
 triggered_event_occurrences: set[tuple[int, int]] = set()
+PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
+STARTUP_EVENT_GRACE = timedelta(seconds=30)
+RECENT_SHUFFLE_SCAN_LIMIT = 20
 
 # -------- Role permissions --------
 
@@ -124,7 +127,11 @@ def pick_text_channel_for_voice(
     return None
 
 
-async def trigger_shuffle_for_event(event: discord.ScheduledEvent) -> None:
+async def trigger_shuffle_for_event(
+    event: discord.ScheduledEvent,
+    *,
+    allow_stale_active: bool = False,
+) -> None:
     """Run shuffle once per event occurrence (event_id + start_time)."""
     if event.entity_type != discord.EntityType.voice:
         return
@@ -137,7 +144,19 @@ async def trigger_shuffle_for_event(event: discord.ScheduledEvent) -> None:
     if key in triggered_event_occurrences:
         return
 
-    triggered_event_occurrences.add(key)
+    # On reconnect/restart, Discord may surface an already-active event again.
+    # If this occurrence started before the current process came up, do not
+    # replay its shuffle.
+    if (
+        not allow_stale_active
+        and
+        event.status is discord.EventStatus.active
+        and event.start_time is not None
+        and event.start_time < (PROCESS_STARTED_AT - STARTUP_EVENT_GRACE)
+    ):
+        triggered_event_occurrences.add(key)
+        print(f"Skipping stale active event {event.id} on startup/reconnect")
+        return
 
     guild = event.guild
     voice_channel = guild.get_channel(event.channel_id)
@@ -150,6 +169,25 @@ async def trigger_shuffle_for_event(event: discord.ScheduledEvent) -> None:
         print(f"No text channel found for voice channel {voice_channel.id}")
         return
 
+    # Survive container restarts by checking whether this channel already has a
+    # recent shuffle message from this bot for the current event window.
+    try:
+        after = (
+            event.start_time - timedelta(minutes=1)
+            if event.start_time is not None
+            else None
+        )
+        async for message in text_channel.history(limit=RECENT_SHUFFLE_SCAN_LIMIT, after=after):
+            if bot.user is None or message.author.id != bot.user.id:
+                continue
+            if message.content.startswith("🎲 **Shuffled list:**"):
+                triggered_event_occurrences.add(key)
+                print(f"Skipping duplicate shuffle for event {event.id}: message already exists")
+                return
+    except Exception as e:
+        print(f"Could not inspect recent shuffle history for event {event.id}: {e}")
+
+    triggered_event_occurrences.add(key)
     await start_shuffle_for_channel(guild, voice_channel, text_channel)
 
 
@@ -430,7 +468,7 @@ async def create_scheduled_shuffle_event(
 
         # Run shuffle for this event occurrence
         try:
-            await trigger_shuffle_for_event(ev or event)
+            await trigger_shuffle_for_event(ev or event, allow_stale_active=True)
         except Exception as e:
             print(f"Error running auto-shuffle: {e}")
 
@@ -724,7 +762,7 @@ async def attach_event(ctx: commands.Context, event_id: str):
 
         # Run shuffle for this event occurrence
         try:
-            await trigger_shuffle_for_event(ev)
+            await trigger_shuffle_for_event(ev, allow_stale_active=True)
         except Exception as e:
             print(f"[attach_event] Error running shuffle: {e}")
 
