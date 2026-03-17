@@ -68,6 +68,8 @@ def build_content(guild: discord.Guild, order, labels=None) -> str:
         member = guild.get_member(user_id)
         base = member.display_name if member else f"Unknown user ({user_id})"
         shown = labels.get(user_id, base)
+        if i == 1:
+            shown = f"@{shown}"
         lines.append(f"{i}. {shown}")
     return "\n".join(lines)
 
