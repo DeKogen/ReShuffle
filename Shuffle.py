@@ -52,7 +52,9 @@ async def on_ready():
     except Exception as e:
         print(f'Failed to sync commands: {e}')
 
-    # If any scheduled events are already active, trigger shuffles on startup.
+    # Do not replay shuffles for events that were already active before startup.
+    # A restart clears in-memory dedupe state, so we only mark those occurrences
+    # as seen to prevent duplicate shuffle messages after reconnects/redeploys.
     for guild in bot.guilds:
         try:
             events = await guild.fetch_scheduled_events()
@@ -62,10 +64,8 @@ async def on_ready():
 
         for ev in events:
             if ev.status is discord.EventStatus.active:
-                try:
-                    await trigger_shuffle_for_event(ev)
-                except Exception as e:
-                    print(f"Error auto-triggering shuffle for event {ev.id}: {e}")
+                start_ts = int(ev.start_time.timestamp()) if ev.start_time else 0
+                triggered_event_occurrences.add((ev.id, start_ts))
 
 
 @bot.event
