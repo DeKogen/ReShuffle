@@ -24,14 +24,20 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # text_channel_id -> shuffle state
 active_shuffles: dict[int, dict] = {}
 triggered_event_occurrences: set[tuple[int, int]] = set()
+triggering_event_occurrences: set[tuple[int, int]] = set()
+scheduled_event_tasks: dict[tuple[int, int], asyncio.Task] = {}
+planned_event_messages: dict[tuple[int, int], tuple[int, int]] = {}
 PROCESS_STARTED_AT = datetime.now(timezone.utc)
 
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
 STARTUP_CLOCK_SKEW = timedelta(seconds=5)
+PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
+SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
+FROZEN_EVENT_MARKER = "[замороженно]"
 
 # -------- Role permissions --------
 
-RELIABLE_ROLE_NAME = "товарищ"
+RELIABLE_ROLE_NAME = "Товарищ"
 _reliable_role_id_env = os.getenv("RELIABLE_ROLE_ID")
 RELIABLE_ROLE_ID = int(_reliable_role_id_env) if _reliable_role_id_env else None
 
@@ -40,7 +46,13 @@ def has_reliable_role(member: discord.Member) -> bool:
     """Check if member has the 'reliable' role (by ID if set, otherwise by name)."""
     if RELIABLE_ROLE_ID is not None:
         return any(role.id == RELIABLE_ROLE_ID for role in member.roles)
-    return any(role.name == RELIABLE_ROLE_NAME for role in member.roles)
+    required_name = RELIABLE_ROLE_NAME.casefold()
+    return any(role.name.casefold() == required_name for role in member.roles)
+
+
+def is_frozen_event(event: discord.ScheduledEvent) -> bool:
+    """Frozen events must not auto-post notices or run shuffles."""
+    return FROZEN_EVENT_MARKER in event.name.casefold()
 
 
 # -------- Events --------
@@ -65,9 +77,35 @@ async def on_ready():
             continue
 
         for ev in events:
+            if is_frozen_event(ev):
+                continue
+
             if ev.status is discord.EventStatus.active:
                 start_ts = int(ev.start_time.timestamp()) if ev.start_time else 0
                 triggered_event_occurrences.add((ev.id, start_ts))
+                continue
+
+            if (
+                ev.entity_type is discord.EntityType.voice
+                and ev.start_time is not None
+                and ev.start_time > datetime.now(timezone.utc)
+            ):
+                voice_channel = guild.get_channel(ev.channel_id) if ev.channel_id else None
+                if not isinstance(voice_channel, discord.VoiceChannel):
+                    continue
+
+                text_channel = pick_text_channel_for_voice(voice_channel)
+                if text_channel is None:
+                    continue
+
+                end_time = ev.end_time or (ev.start_time + timedelta(hours=2))
+                schedule_event_lifecycle(
+                    guild.id,
+                    ev.id,
+                    ev.start_time,
+                    end_time,
+                    text_channel.id,
+                )
 
 
 @bot.event
@@ -80,6 +118,21 @@ async def on_message(message: discord.Message):
 @bot.event
 async def on_guild_scheduled_event_update(before, after):
     """Auto-trigger shuffle when a voice scheduled event becomes active."""
+    before_key = event_occurrence_key(before.id, before.start_time)
+    after_key = event_occurrence_key(after.id, after.start_time)
+    if before_key != after_key:
+        task = scheduled_event_tasks.pop(before_key, None)
+        if task is not None:
+            task.cancel()
+        planned_event_messages.pop(before_key, None)
+
+    if is_frozen_event(after):
+        task = scheduled_event_tasks.pop(after_key, None)
+        if task is not None:
+            task.cancel()
+        planned_event_messages.pop(after_key, None)
+        return
+
     if after.status is discord.EventStatus.active and before.status is not discord.EventStatus.active:
         if (
             after.start_time is not None
@@ -90,6 +143,24 @@ async def on_guild_scheduled_event_update(before, after):
             print(f"Ignoring scheduled event update for already-started event {after.id}")
             return
         await trigger_shuffle_for_event(after)
+
+    if (
+        after.entity_type is discord.EntityType.voice
+        and after.start_time is not None
+        and after.status is discord.EventStatus.scheduled
+    ):
+        voice_channel = after.guild.get_channel(after.channel_id) if after.channel_id else None
+        if isinstance(voice_channel, discord.VoiceChannel):
+            text_channel = pick_text_channel_for_voice(voice_channel)
+            if text_channel is not None:
+                end_time = after.end_time or (after.start_time + timedelta(hours=2))
+                schedule_event_lifecycle(
+                    after.guild.id,
+                    after.id,
+                    after.start_time,
+                    end_time,
+                    text_channel.id,
+                )
 
 
 # -------- Shuffle helpers --------
@@ -134,68 +205,288 @@ def pick_text_channel_for_voice(
     return None
 
 
+def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple[int, int]:
+    start_ts = int(start_time.timestamp()) if start_time else 0
+    return (event_id, start_ts)
+
+
+def build_planned_shuffle_content(
+    event_name: str,
+    voice_channel: discord.VoiceChannel,
+    start_time: datetime,
+) -> str:
+    start_ts = int(start_time.timestamp())
+    return (
+        f"{PLANNED_SHUFFLE_PREFIX} **{event_name}**\n"
+        f"Voice channel: {voice_channel.mention}\n"
+        f"Starts: <t:{start_ts}:R> (<t:{start_ts}:t>)\n"
+        f"This message will be updated with the shuffled list when the event starts."
+    )
+
+
+async def find_reusable_event_message(
+    text_channel,
+    event: discord.ScheduledEvent,
+) -> tuple[Optional[discord.Message], Optional[discord.Message]]:
+    """Find recent shuffle or planned messages for this event window."""
+    shuffle_message = None
+    planned_message = None
+
+    key = event_occurrence_key(event.id, event.start_time)
+    stored_message = planned_event_messages.get(key)
+    if stored_message is not None:
+        stored_channel_id, message_id = stored_message
+        if stored_channel_id == text_channel.id:
+            try:
+                planned_message = await text_channel.fetch_message(message_id)
+            except discord.NotFound:
+                planned_event_messages.pop(key, None)
+            except Exception as e:
+                print(f"Could not fetch planned message for event {event.id}: {e}")
+
+    after = (
+        event.start_time - timedelta(minutes=2)
+        if event.start_time is not None
+        else None
+    )
+
+    try:
+        async for message in text_channel.history(limit=None, after=after):
+            if bot.user is None or message.author.id != bot.user.id:
+                continue
+            if message.content.startswith(SHUFFLE_LIST_PREFIX):
+                shuffle_message = message
+                break
+            if (
+                planned_message is None
+                and message.content.startswith(PLANNED_SHUFFLE_PREFIX)
+            ):
+                planned_message = message
+    except Exception as e:
+        print(f"Could not inspect recent shuffle history for event {event.id}: {e}")
+
+    return shuffle_message, planned_message
+
+
+async def send_planned_shuffle_notice(
+    event: discord.ScheduledEvent,
+    text_channel,
+    voice_channel: discord.VoiceChannel,
+) -> Optional[discord.Message]:
+    """Send or reuse the one-minute warning message for an event."""
+    if is_frozen_event(event):
+        return None
+
+    key = event_occurrence_key(event.id, event.start_time)
+    _, planned_message = await find_reusable_event_message(text_channel, event)
+    if planned_message is not None:
+        try:
+            await planned_message.edit(
+                content=build_planned_shuffle_content(event.name, voice_channel, event.start_time)
+            )
+        except discord.NotFound:
+            planned_message = None
+        except Exception as e:
+            print(f"Could not refresh planned message for event {event.id}: {e}")
+
+    if planned_message is not None:
+        planned_event_messages[key] = (text_channel.id, planned_message.id)
+        return planned_message
+
+    try:
+        message = await text_channel.send(
+            build_planned_shuffle_content(event.name, voice_channel, event.start_time)
+        )
+    except Exception as e:
+        print(f"Could not send planned shuffle notice for event {event.id}: {e}")
+        return None
+
+    planned_event_messages[key] = (text_channel.id, message.id)
+    return message
+
+
+def schedule_event_lifecycle(
+    guild_id: int,
+    event_id: int,
+    start_time: datetime,
+    end_time: datetime,
+    text_channel_id: int,
+    *,
+    replace_existing: bool = False,
+) -> None:
+    """Schedule notice/start/end handling for one event occurrence."""
+    key = event_occurrence_key(event_id, start_time)
+    existing_task = scheduled_event_tasks.get(key)
+    if existing_task is not None and not existing_task.done():
+        if not replace_existing:
+            return
+        existing_task.cancel()
+
+    async def run_event_lifecycle():
+        planned_message = None
+        try:
+            await bot.wait_until_ready()
+
+            notice_time = start_time - timedelta(minutes=1)
+            now = datetime.now(timezone.utc)
+            if notice_time > now:
+                await discord.utils.sleep_until(notice_time)
+
+            guild_obj = bot.get_guild(guild_id)
+            if guild_obj is None:
+                return
+
+            text_channel = guild_obj.get_channel(text_channel_id)
+            if text_channel is None:
+                return
+
+            try:
+                ev = await guild_obj.fetch_scheduled_event(event_id)
+            except discord.NotFound:
+                return
+            except Exception as e:
+                print(f"Error fetching scheduled event (notice): {e}")
+                ev = None
+
+            if (
+                ev is not None
+                and ev.start_time is not None
+                and ev.status is discord.EventStatus.scheduled
+                and ev.channel_id is not None
+            ):
+                voice_channel = guild_obj.get_channel(ev.channel_id)
+                if isinstance(voice_channel, discord.VoiceChannel):
+                    planned_message = await send_planned_shuffle_notice(ev, text_channel, voice_channel)
+
+            if start_time > datetime.now(timezone.utc):
+                await discord.utils.sleep_until(start_time)
+
+            guild_obj = bot.get_guild(guild_id)
+            if guild_obj is None:
+                return
+
+            try:
+                ev = await guild_obj.fetch_scheduled_event(event_id)
+            except discord.NotFound:
+                return
+            except Exception as e:
+                print(f"Error fetching scheduled event (start): {e}")
+                ev = None
+
+            if ev is not None:
+                try:
+                    if ev.status is discord.EventStatus.scheduled:
+                        await ev.edit(status=discord.EventStatus.active)
+                        print(f"Auto-activated event {ev.name} ({ev.id})")
+                except Exception as e:
+                    print(f"Error auto-activating event: {e}")
+
+            try:
+                await trigger_shuffle_for_event(
+                    ev or discord.Object(id=event_id),
+                    allow_stale_active=True,
+                    preferred_text_channel=text_channel,
+                    preferred_message=planned_message,
+                )
+            except Exception as e:
+                print(f"Error running auto-shuffle: {e}")
+
+            if end_time > datetime.now(timezone.utc):
+                await discord.utils.sleep_until(end_time)
+
+            guild_obj = bot.get_guild(guild_id)
+            if guild_obj is None:
+                return
+
+            try:
+                ev = await guild_obj.fetch_scheduled_event(event_id)
+            except discord.NotFound:
+                return
+            except Exception as e:
+                print(f"Error fetching scheduled event (end): {e}")
+                return
+
+            try:
+                if ev.status is not discord.EventStatus.completed:
+                    await ev.edit(status=discord.EventStatus.completed)
+                    print(f"Auto-completed event {ev.name} ({ev.id})")
+            except Exception as e:
+                print(f"Error auto-completing event: {e}")
+        finally:
+            if scheduled_event_tasks.get(key) is asyncio.current_task():
+                scheduled_event_tasks.pop(key, None)
+
+    task = bot.loop.create_task(run_event_lifecycle())
+    scheduled_event_tasks[key] = task
+
+
 async def trigger_shuffle_for_event(
     event: discord.ScheduledEvent,
     *,
     allow_stale_active: bool = False,
+    preferred_text_channel=None,
+    preferred_message: Optional[discord.Message] = None,
 ) -> None:
     """Run shuffle once per event occurrence (event_id + start_time)."""
+    if not isinstance(event, discord.ScheduledEvent):
+        return
+
+    if is_frozen_event(event):
+        return
+
     if event.entity_type != discord.EntityType.voice:
         return
 
     if event.channel_id is None:
         return
 
-    start_ts = int(event.start_time.timestamp()) if event.start_time else 0
-    key = (event.id, start_ts)
-    if key in triggered_event_occurrences:
+    key = event_occurrence_key(event.id, event.start_time)
+    if key in triggered_event_occurrences or key in triggering_event_occurrences:
         return
+    triggering_event_occurrences.add(key)
 
-    # On reconnect/restart, Discord may surface an already-active event again.
-    # If this occurrence started before the current process came up, do not
-    # replay its shuffle.
-    if (
-        not allow_stale_active
-        and
-        event.status is discord.EventStatus.active
-        and event.start_time is not None
-        and event.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
-    ):
-        triggered_event_occurrences.add(key)
-        print(f"Skipping stale active event {event.id} on startup/reconnect")
-        return
-
-    guild = event.guild
-    voice_channel = guild.get_channel(event.channel_id)
-    if not isinstance(voice_channel, discord.VoiceChannel):
-        print(f"Event {event.id} has no valid voice channel")
-        return
-
-    text_channel = pick_text_channel_for_voice(voice_channel)
-    if text_channel is None:
-        print(f"No text channel found for voice channel {voice_channel.id}")
-        return
-
-    # Survive container restarts by checking whether this channel already has a
-    # recent shuffle message from this bot for the current event window.
     try:
-        after = (
-            event.start_time - timedelta(minutes=1)
-            if event.start_time is not None
-            else None
-        )
-        async for message in text_channel.history(limit=None, after=after):
-            if bot.user is None or message.author.id != bot.user.id:
-                continue
-            if message.content.startswith("🎲 **Shuffled list:**"):
-                triggered_event_occurrences.add(key)
-                print(f"Skipping duplicate shuffle for event {event.id}: message already exists")
-                return
-    except Exception as e:
-        print(f"Could not inspect recent shuffle history for event {event.id}: {e}")
+        # On reconnect/restart, Discord may surface an already-active event again.
+        # If this occurrence started before the current process came up, do not
+        # replay its shuffle.
+        if (
+            not allow_stale_active
+            and
+            event.status is discord.EventStatus.active
+            and event.start_time is not None
+            and event.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
+        ):
+            triggered_event_occurrences.add(key)
+            print(f"Skipping stale active event {event.id} on startup/reconnect")
+            return
 
-    triggered_event_occurrences.add(key)
-    await start_shuffle_for_channel(guild, voice_channel, text_channel)
+        guild = event.guild
+        voice_channel = guild.get_channel(event.channel_id)
+        if not isinstance(voice_channel, discord.VoiceChannel):
+            print(f"Event {event.id} has no valid voice channel")
+            return
+
+        text_channel = preferred_text_channel or pick_text_channel_for_voice(voice_channel)
+        if text_channel is None:
+            print(f"No text channel found for voice channel {voice_channel.id}")
+            return
+
+        shuffle_message, planned_message = await find_reusable_event_message(text_channel, event)
+        if shuffle_message is not None:
+            triggered_event_occurrences.add(key)
+            print(f"Skipping duplicate shuffle for event {event.id}: message already exists")
+            return
+
+        triggered_event_occurrences.add(key)
+        planned_message = preferred_message or planned_message
+        await start_shuffle_for_channel(
+            guild,
+            voice_channel,
+            text_channel,
+            existing_message=planned_message,
+        )
+    finally:
+        triggering_event_occurrences.discard(key)
 
 
 def build_content(guild: discord.Guild, order, labels=None) -> str:
@@ -203,13 +494,22 @@ def build_content(guild: discord.Guild, order, labels=None) -> str:
     if labels is None:
         labels = {}
 
-    lines = ["🎲 **Shuffled list:**"]
+    lines = [SHUFFLE_LIST_PREFIX]
     for i, user_id in enumerate(order, 1):
         member = guild.get_member(user_id)
         base = member.display_name if member else f"Unknown user ({user_id})"
         shown = labels.get(user_id, base)
         if i == 1:
-            shown = f"@{shown}"
+            if member is not None:
+                if shown == member.display_name:
+                    shown = member.mention
+                elif shown.startswith(member.display_name):
+                    suffix = shown[len(member.display_name):]
+                    shown = f"{member.mention}{suffix}"
+                else:
+                    shown = f"{member.mention} ({shown})"
+            else:
+                shown = f"@{shown}"
         lines.append(f"{i}. {shown}")
     return "\n".join(lines)
 
@@ -277,7 +577,9 @@ async def schedule_removal(text_channel_id: int, member_id: int) -> None:
 async def start_shuffle_for_channel(
     guild: discord.Guild,
     voice_channel: discord.VoiceChannel,
-    text_channel: discord.abc.Messageable
+    text_channel: discord.abc.Messageable,
+    *,
+    existing_message: Optional[discord.Message] = None,
 ) -> None:
     """
     Common shuffle logic:
@@ -287,7 +589,13 @@ async def start_shuffle_for_channel(
     members = [m for m in voice_channel.members if not m.bot]
 
     if not members:
-        await text_channel.send("No members in the voice channel!")
+        if existing_message is not None:
+            try:
+                await existing_message.edit(content="No members in the voice channel!")
+            except discord.NotFound:
+                await text_channel.send("No members in the voice channel!")
+        else:
+            await text_channel.send("No members in the voice channel!")
         return
 
     order = [m.id for m in members]
@@ -296,7 +604,14 @@ async def start_shuffle_for_channel(
     labels: dict[int, str] = {}  # labels for ✨ / 🌌
 
     content = build_content(guild, order, labels)
-    msg = await text_channel.send(content)
+    if existing_message is not None:
+        try:
+            await existing_message.edit(content=content)
+            msg = existing_message
+        except discord.NotFound:
+            msg = await text_channel.send(content)
+    else:
+        msg = await text_channel.send(content)
 
     active_shuffles[text_channel.id] = {
         "created_at": datetime.now(),
@@ -321,6 +636,28 @@ async def cleanup_old_shuffle(channel_id: int, delay_sec: int) -> None:
     if state:
         for task in state["pending_removals"].values():
             task.cancel()
+
+
+async def defer_hybrid_command(ctx: commands.Context) -> None:
+    """Acknowledge slash invocations that send their real output directly to the channel."""
+    if ctx.interaction is None or ctx.interaction.response.is_done():
+        return
+
+    await ctx.defer(ephemeral=True)
+
+
+async def finish_hybrid_command(ctx: commands.Context, content: str) -> None:
+    """Finish a deferred slash invocation with an ephemeral confirmation."""
+    if ctx.interaction is None:
+        return
+
+    try:
+        if ctx.interaction.response.is_done():
+            await ctx.interaction.followup.send(content, ephemeral=True)
+        else:
+            await ctx.send(content, ephemeral=True)
+    except Exception as e:
+        print(f"Error sending command followup: {e}")
 
 
 @bot.event
@@ -443,66 +780,14 @@ async def create_scheduled_shuffle_event(
     )
 
     guild_id = guild.id
-    event_id = event.id
-
-    async def auto_start_and_complete():
-        await bot.wait_until_ready()
-
-        # ---- EVENT START ----
-        await discord.utils.sleep_until(start_time)
-
-        guild_obj = bot.get_guild(guild_id)
-        if guild_obj is None:
-            return
-
-        try:
-            ev = await guild_obj.fetch_scheduled_event(event_id)
-        except discord.NotFound:
-            # event was deleted manually
-            return
-        except Exception as e:
-            print(f"Error fetching scheduled event (start): {e}")
-            ev = None
-
-        # Change status to active if still scheduled
-        if ev is not None:
-            try:
-                if ev.status is discord.EventStatus.scheduled:
-                    await ev.edit(status=discord.EventStatus.active)
-                    print(f"Auto-activated event {ev.name} ({ev.id})")
-            except Exception as e:
-                print(f"Error auto-activating event: {e}")
-
-        # Run shuffle for this event occurrence
-        try:
-            await trigger_shuffle_for_event(ev or event, allow_stale_active=True)
-        except Exception as e:
-            print(f"Error running auto-shuffle: {e}")
-
-        # ---- EVENT END ----
-        await discord.utils.sleep_until(end_time)
-
-        guild_obj = bot.get_guild(guild_id)
-        if guild_obj is None:
-            return
-
-        try:
-            ev = await guild_obj.fetch_scheduled_event(event_id)
-        except discord.NotFound:
-            # event removed manually
-            return
-        except Exception as e:
-            print(f"Error fetching scheduled event (end): {e}")
-            return
-
-        try:
-            if ev.status is not discord.EventStatus.completed:
-                await ev.edit(status=discord.EventStatus.completed)
-                print(f"Auto-completed event {ev.name} ({ev.id})")
-        except Exception as e:
-            print(f"Error auto-completing event: {e}")
-
-    bot.loop.create_task(auto_start_and_complete())
+    schedule_event_lifecycle(
+        guild_id,
+        event.id,
+        start_time,
+        end_time,
+        shuffle_target.id,
+        replace_existing=True,
+    )
 
 
 # ===============================
@@ -514,12 +799,15 @@ async def create_scheduled_shuffle_event(
     description='Shuffle members in your voice channel'
 )
 async def shuffle_voice_members(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
     if ctx.author.voice is None or ctx.author.voice.channel is None:
         await ctx.send("You need to be in a voice channel to use this command!")
         return
 
     voice_channel = ctx.author.voice.channel
     await start_shuffle_for_channel(ctx.guild, voice_channel, ctx.channel)
+    await finish_hybrid_command(ctx, "Shuffle posted in this channel.")
 
 
 # ===============================
@@ -537,6 +825,8 @@ async def schedule_event(
     *,
     name: str = "Shuffle session"
 ):
+    await defer_hybrid_command(ctx)
+
     if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
         await ctx.send(
             f"You do not have permission to schedule events. "
@@ -557,6 +847,7 @@ async def schedule_event(
         duration_minutes,
         name
     )
+    await finish_hybrid_command(ctx, "Scheduled event created.")
 
 
 # ===============================
@@ -666,6 +957,8 @@ async def schedule_event_menu(interaction: discord.Interaction):
 )
 async def attach_event(ctx: commands.Context, event_id: str):
     """Attach auto-shuffle to an already existing (possibly recurring) voice event."""
+    await defer_hybrid_command(ctx)
+
     user = ctx.author
 
     # Permission check
@@ -740,61 +1033,14 @@ async def attach_event(ctx: commands.Context, event_id: str):
     )
 
     guild_id = guild.id
-
-    async def auto_start_and_complete_existing():
-        await bot.wait_until_ready()
-
-        guild_obj = bot.get_guild(guild_id)
-        if guild_obj is None:
-            return
-
-        # ---- HANDLE START ----
-        if start_time > datetime.now(timezone.utc):
-            await discord.utils.sleep_until(start_time)
-
-        # Re-fetch current state of event
-        try:
-            ev = await guild_obj.fetch_scheduled_event(event.id)
-        except Exception as e:
-            print(f"[attach_event] Error fetching event at start: {e}")
-            return
-
-        # Try to set active if still scheduled
-        try:
-            if ev.status is discord.EventStatus.scheduled:
-                await ev.edit(status=discord.EventStatus.active)
-                print(f"[attach_event] Auto-activated event {ev.name} ({ev.id})")
-        except Exception as e:
-            print(f"[attach_event] Error auto-activating event: {e}")
-
-        # Run shuffle for this event occurrence
-        try:
-            await trigger_shuffle_for_event(ev, allow_stale_active=True)
-        except Exception as e:
-            print(f"[attach_event] Error running shuffle: {e}")
-
-        # ---- HANDLE END ----
-        if end_time > datetime.now(timezone.utc):
-            await discord.utils.sleep_until(end_time)
-
-        guild_obj = bot.get_guild(guild_id)
-        if guild_obj is None:
-            return
-
-        try:
-            ev = await guild_obj.fetch_scheduled_event(event.id)
-        except Exception as e:
-            print(f"[attach_event] Error fetching event at end: {e}")
-            return
-
-        try:
-            if ev.status is not discord.EventStatus.completed:
-                await ev.edit(status=discord.EventStatus.completed)
-                print(f"[attach_event] Auto-completed event {ev.name} ({ev.id})")
-        except Exception as e:
-            print(f"[attach_event] Error auto-completing event: {e}")
-
-    bot.loop.create_task(auto_start_and_complete_existing())
+    schedule_event_lifecycle(
+        guild_id,
+        event.id,
+        start_time,
+        end_time,
+        shuffle_target.id,
+        replace_existing=True,
+    )
 
 
 # ===============================
@@ -807,6 +1053,8 @@ async def attach_event(ctx: commands.Context, event_id: str):
 )
 async def list_events(ctx: commands.Context):
     """Show all scheduled server events that this bot can see, with their IDs."""
+    await defer_hybrid_command(ctx)
+
     guild = ctx.guild
     if guild is None:
         await ctx.send("This command can only be used inside a server.")
