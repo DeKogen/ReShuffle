@@ -146,6 +146,9 @@ cython_debug/
 # Discord bot specific
 config.json
 *.db
+voice_activity.sqlite3
+voice_activity.sqlite3-*
+event_text_channel_targets.json
 logs/
 *.log.*
 

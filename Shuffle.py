@@ -2,9 +2,12 @@ import discord
 from discord.ext import commands
 import random
 import asyncio
+import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 import os
 import re
+import traceback
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -20,26 +23,694 @@ intents.members = True  # do not forget to enable in Dev Portal
 intents.guild_scheduled_events = True
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+USE_GUILD_ONLY_APP_COMMANDS = True
 
 # text_channel_id -> shuffle state
 active_shuffles: dict[int, dict] = {}
+# (guild_id, voice_channel_id) -> camera enforcement state
+active_camera_enforcements: dict[tuple[int, int], dict] = {}
 triggered_event_occurrences: set[tuple[int, int]] = set()
 triggering_event_occurrences: set[tuple[int, int]] = set()
 scheduled_event_tasks: dict[tuple[int, int], asyncio.Task] = {}
 planned_event_messages: dict[tuple[int, int], tuple[int, int]] = {}
+event_text_channel_targets: dict[str, int] = {}
+persistent_shuffle_exclusions: dict[int, set[int]] = {}
+shuffle_settings: dict[int, dict[str, bool]] = {}
 PROCESS_STARTED_AT = datetime.now(timezone.utc)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
+CAMERA_GRACE_SECONDS = 30  # seconds to allow camera-off state before disconnecting
+SHUFFLE_TRACKING_WINDOW = 600  # seconds to keep accepting join/leave updates
 STARTUP_CLOCK_SKEW = timedelta(seconds=5)
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
 FROZEN_EVENT_MARKER = "[замороженно]"
+CAMERA_SOURCE_MANUAL = "manual"
+CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
+
+
+def resolve_data_dir() -> str:
+    """Pick a writable directory for runtime state files."""
+    configured_dir = os.getenv("RESHUFFLE_DATA_DIR")
+    if configured_dir:
+        data_dir = os.path.abspath(os.path.expanduser(configured_dir))
+        os.makedirs(data_dir, exist_ok=True)
+        return data_dir
+
+    if os.access(BASE_DIR, os.W_OK):
+        return BASE_DIR
+
+    fallback_dir = os.path.join(os.path.expanduser("~"), ".reshuffle")
+    os.makedirs(fallback_dir, exist_ok=True)
+    return fallback_dir
+
+
+DATA_DIR = resolve_data_dir()
+EVENT_TARGETS_FILE = os.path.join(DATA_DIR, "event_text_channel_targets.json")
+PERSISTENT_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "persistent_shuffle_exclusions.json")
+SHUFFLE_SETTINGS_FILE = os.path.join(DATA_DIR, "shuffle_settings.json")
+SHUFFLE_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_admin_audit.jsonl")
+VOICE_STATS_DB_FILE = os.path.join(DATA_DIR, "voice_activity.sqlite3")
+
+
+def utc_now() -> datetime:
+    """Return the current time in UTC."""
+    return datetime.now(timezone.utc)
+
+
+def to_storage_datetime(value: datetime) -> str:
+    """Serialize a timezone-aware datetime to ISO-8601 UTC."""
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def from_storage_datetime(value: str) -> datetime:
+    """Parse a stored ISO-8601 datetime and normalize it to UTC."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def is_trackable_voice_channel(channel) -> bool:
+    """Track classic voice and stage channels for activity stats."""
+    return isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+
+
+def get_voice_db_connection() -> sqlite3.Connection:
+    """Create a SQLite connection for voice activity data."""
+    connection = sqlite3.connect(VOICE_STATS_DB_FILE)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def init_voice_tracking_db() -> None:
+    """Create the voice tracking tables if they do not exist yet."""
+    with get_voice_db_connection() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS voice_sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_display_name TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                channel_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                ended_at TEXT NOT NULL,
+                duration_seconds INTEGER NOT NULL CHECK(duration_seconds >= 0),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user_started
+            ON voice_sessions(guild_id, user_id, started_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_started
+            ON voice_sessions(guild_id, started_at DESC);
+
+            CREATE TABLE IF NOT EXISTS active_voice_sessions (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_display_name TEXT NOT NULL,
+                channel_id INTEGER NOT NULL,
+                channel_name TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                PRIMARY KEY (guild_id, user_id)
+            );
+            """
+        )
+
+
+def format_duration(total_seconds: int) -> str:
+    """Render a compact human-readable duration."""
+    total_seconds = max(0, int(total_seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes or hours:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def format_timezone_label() -> str:
+    """Return a short timezone label for reports."""
+    now_local = datetime.now().astimezone(LOCAL_TIMEZONE)
+    tz_name = now_local.tzname() or "local time"
+    offset = now_local.strftime("%z")
+    if not offset:
+        return tz_name
+    return f"{tz_name} ({offset[:3]}:{offset[3:]})"
+
+
+def start_of_local_day(reference: Optional[datetime] = None) -> datetime:
+    """Return the start of the local day for the provided instant."""
+    local_reference = (reference or utc_now()).astimezone(LOCAL_TIMEZONE)
+    return local_reference.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def start_of_local_week(reference: Optional[datetime] = None) -> datetime:
+    """Return the start of the local week (Monday 00:00 local time)."""
+    day_start = start_of_local_day(reference)
+    return day_start - timedelta(days=day_start.weekday())
+
+
+def normalize_report_limit(value: int, *, default: int, minimum: int, maximum: int) -> int:
+    """Clamp a numeric report limit into a safe range."""
+    if value is None:
+        return default
+    return max(minimum, min(maximum, value))
+
+
+def resolve_member_display_name(
+    guild: Optional[discord.Guild],
+    user_id: int,
+    fallback_name: str,
+) -> str:
+    """Prefer the current member display name and fall back to the stored snapshot."""
+    if guild is not None:
+        member = guild.get_member(user_id)
+        if member is not None:
+            return member.display_name
+    return fallback_name or f"User {user_id}"
+
+
+def resolve_voice_channel_label(
+    guild: Optional[discord.Guild],
+    channel_id: int,
+    fallback_name: str,
+) -> str:
+    """Prefer the current voice channel name and fall back to the stored snapshot."""
+    if guild is not None:
+        channel = guild.get_channel(channel_id)
+        if is_trackable_voice_channel(channel):
+            return channel.name
+    return fallback_name or f"channel-{channel_id}"
+
+
+def get_active_voice_session_row(guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
+    """Fetch one active voice session for a guild member."""
+    with get_voice_db_connection() as conn:
+        return conn.execute(
+            """
+            SELECT guild_id, user_id, user_display_name, channel_id, channel_name, started_at
+            FROM active_voice_sessions
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+
+def list_active_voice_session_rows(guild_id: Optional[int] = None) -> list[sqlite3.Row]:
+    """Fetch active voice sessions, optionally scoped to one guild."""
+    query = (
+        "SELECT guild_id, user_id, user_display_name, channel_id, channel_name, started_at "
+        "FROM active_voice_sessions"
+    )
+    params: tuple = ()
+    if guild_id is not None:
+        query += " WHERE guild_id = ?"
+        params = (guild_id,)
+    query += " ORDER BY started_at DESC"
+
+    with get_voice_db_connection() as conn:
+        return conn.execute(query, params).fetchall()
+
+
+def _finalize_active_voice_session(
+    conn: sqlite3.Connection,
+    active_row: sqlite3.Row,
+    *,
+    ended_at: datetime,
+) -> dict:
+    """Write a completed voice session and remove the active row."""
+    started_at = from_storage_datetime(active_row["started_at"])
+    ended_at = max(ended_at.astimezone(timezone.utc), started_at)
+    duration_seconds = int((ended_at - started_at).total_seconds())
+
+    conn.execute(
+        """
+        INSERT INTO voice_sessions (
+            guild_id,
+            user_id,
+            user_display_name,
+            channel_id,
+            channel_name,
+            started_at,
+            ended_at,
+            duration_seconds
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            active_row["guild_id"],
+            active_row["user_id"],
+            active_row["user_display_name"],
+            active_row["channel_id"],
+            active_row["channel_name"],
+            to_storage_datetime(started_at),
+            to_storage_datetime(ended_at),
+            duration_seconds,
+        ),
+    )
+    conn.execute(
+        "DELETE FROM active_voice_sessions WHERE guild_id = ? AND user_id = ?",
+        (active_row["guild_id"], active_row["user_id"]),
+    )
+
+    return {
+        "guild_id": active_row["guild_id"],
+        "user_id": active_row["user_id"],
+        "user_display_name": active_row["user_display_name"],
+        "channel_id": active_row["channel_id"],
+        "channel_name": active_row["channel_name"],
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def start_voice_session(
+    member: discord.Member,
+    channel: discord.abc.GuildChannel,
+    *,
+    started_at: Optional[datetime] = None,
+) -> None:
+    """Start tracking a member's voice session, closing any stale active row first."""
+    if member.bot or not is_trackable_voice_channel(channel):
+        return
+
+    session_started_at = (started_at or utc_now()).astimezone(timezone.utc)
+
+    with get_voice_db_connection() as conn:
+        active_row = conn.execute(
+            """
+            SELECT guild_id, user_id, user_display_name, channel_id, channel_name, started_at
+            FROM active_voice_sessions
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (member.guild.id, member.id),
+        ).fetchone()
+
+        if active_row is not None:
+            if active_row["channel_id"] == channel.id:
+                conn.execute(
+                    """
+                    UPDATE active_voice_sessions
+                    SET user_display_name = ?, channel_name = ?
+                    WHERE guild_id = ? AND user_id = ?
+                    """,
+                    (member.display_name, channel.name, member.guild.id, member.id),
+                )
+                return
+
+            _finalize_active_voice_session(conn, active_row, ended_at=session_started_at)
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO active_voice_sessions (
+                guild_id,
+                user_id,
+                user_display_name,
+                channel_id,
+                channel_name,
+                started_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                member.guild.id,
+                member.id,
+                member.display_name,
+                channel.id,
+                channel.name,
+                to_storage_datetime(session_started_at),
+            ),
+        )
+
+
+def finish_voice_session(
+    guild_id: int,
+    user_id: int,
+    *,
+    ended_at: Optional[datetime] = None,
+) -> Optional[dict]:
+    """Finish and persist one active voice session if it exists."""
+    session_ended_at = (ended_at or utc_now()).astimezone(timezone.utc)
+
+    with get_voice_db_connection() as conn:
+        active_row = conn.execute(
+            """
+            SELECT guild_id, user_id, user_display_name, channel_id, channel_name, started_at
+            FROM active_voice_sessions
+            WHERE guild_id = ? AND user_id = ?
+            """,
+            (guild_id, user_id),
+        ).fetchone()
+
+        if active_row is None:
+            return None
+
+        return _finalize_active_voice_session(conn, active_row, ended_at=session_ended_at)
+
+
+def load_completed_voice_sessions(
+    guild_id: int,
+    *,
+    user_id: Optional[int] = None,
+    overlap_start: Optional[datetime] = None,
+    overlap_end: Optional[datetime] = None,
+    limit: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Load completed voice sessions that overlap a given time range."""
+    conditions = ["guild_id = ?"]
+    params: list = [guild_id]
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+    if overlap_start is not None:
+        conditions.append("ended_at > ?")
+        params.append(to_storage_datetime(overlap_start))
+    if overlap_end is not None:
+        conditions.append("started_at < ?")
+        params.append(to_storage_datetime(overlap_end))
+
+    query = (
+        "SELECT id, guild_id, user_id, user_display_name, channel_id, channel_name, "
+        "started_at, ended_at, duration_seconds "
+        "FROM voice_sessions "
+        f"WHERE {' AND '.join(conditions)} "
+        "ORDER BY started_at DESC"
+    )
+    if limit is not None:
+        query += f" LIMIT {int(limit)}"
+
+    with get_voice_db_connection() as conn:
+        return conn.execute(query, tuple(params)).fetchall()
+
+
+def load_active_voice_sessions(
+    guild_id: int,
+    *,
+    user_id: Optional[int] = None,
+) -> list[sqlite3.Row]:
+    """Load active voice sessions for one guild, optionally for one user."""
+    conditions = ["guild_id = ?"]
+    params: list = [guild_id]
+
+    if user_id is not None:
+        conditions.append("user_id = ?")
+        params.append(user_id)
+
+    query = (
+        "SELECT guild_id, user_id, user_display_name, channel_id, channel_name, started_at "
+        "FROM active_voice_sessions "
+        f"WHERE {' AND '.join(conditions)} "
+        "ORDER BY started_at DESC"
+    )
+
+    with get_voice_db_connection() as conn:
+        return conn.execute(query, tuple(params)).fetchall()
+
+
+def build_session_record_from_row(
+    row: sqlite3.Row,
+    *,
+    active: bool,
+    now: Optional[datetime] = None,
+) -> dict:
+    """Normalize completed and active DB rows into one report-friendly shape."""
+    started_at = from_storage_datetime(row["started_at"])
+    ended_at = None if active else from_storage_datetime(row["ended_at"])
+    effective_end = (now or utc_now()).astimezone(timezone.utc) if active else ended_at
+
+    return {
+        "guild_id": row["guild_id"],
+        "user_id": row["user_id"],
+        "user_display_name": row["user_display_name"],
+        "channel_id": row["channel_id"],
+        "channel_name": row["channel_name"],
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "effective_end": effective_end,
+        "duration_seconds": int((effective_end - started_at).total_seconds()),
+        "active": active,
+    }
+
+
+def get_session_overlap_seconds(
+    session_start: datetime,
+    session_end: datetime,
+    *,
+    range_start: Optional[datetime] = None,
+    range_end: Optional[datetime] = None,
+) -> int:
+    """Return the number of seconds a session overlaps the requested range."""
+    effective_start = max(session_start, range_start) if range_start is not None else session_start
+    effective_end = min(session_end, range_end) if range_end is not None else session_end
+    return max(0, int((effective_end - effective_start).total_seconds()))
+
+
+def summarize_voice_usage(
+    guild_id: int,
+    user_id: int,
+    *,
+    range_start: Optional[datetime] = None,
+    range_end: Optional[datetime] = None,
+) -> dict:
+    """Summarize a user's voice activity over an optional time range."""
+    now = utc_now()
+    total_seconds = 0
+    session_count = 0
+    active_session = None
+
+    for row in load_completed_voice_sessions(
+        guild_id,
+        user_id=user_id,
+        overlap_start=range_start,
+        overlap_end=range_end,
+    ):
+        session = build_session_record_from_row(row, active=False, now=now)
+        overlap = get_session_overlap_seconds(
+            session["started_at"],
+            session["effective_end"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        if overlap <= 0:
+            continue
+        total_seconds += overlap
+        session_count += 1
+
+    for row in load_active_voice_sessions(guild_id, user_id=user_id):
+        session = build_session_record_from_row(row, active=True, now=now)
+        overlap = get_session_overlap_seconds(
+            session["started_at"],
+            session["effective_end"],
+            range_start=range_start,
+            range_end=range_end,
+        )
+        if overlap <= 0:
+            continue
+        total_seconds += overlap
+        session_count += 1
+        active_session = session
+
+    return {
+        "total_seconds": total_seconds,
+        "session_count": session_count,
+        "active_session": active_session,
+    }
+
+
+def build_daily_voice_breakdown(
+    guild_id: int,
+    user_id: int,
+    *,
+    days: int,
+) -> list[tuple[str, int]]:
+    """Return per-day totals for the last N local days."""
+    days = normalize_report_limit(days, default=7, minimum=1, maximum=31)
+    now = utc_now()
+    now_local = now.astimezone(LOCAL_TIMEZONE)
+    first_day_local = start_of_local_day(now) - timedelta(days=days - 1)
+    period_start_utc = first_day_local.astimezone(timezone.utc)
+
+    buckets: dict[str, int] = {}
+    for offset in range(days):
+        day_start_local = first_day_local + timedelta(days=offset)
+        day_label = day_start_local.strftime("%Y-%m-%d")
+        buckets[day_label] = 0
+
+    completed_rows = load_completed_voice_sessions(
+        guild_id,
+        user_id=user_id,
+        overlap_start=period_start_utc,
+        overlap_end=now,
+    )
+    active_rows = load_active_voice_sessions(guild_id, user_id=user_id)
+
+    sessions = [
+        build_session_record_from_row(row, active=False, now=now)
+        for row in completed_rows
+    ]
+    sessions.extend(
+        build_session_record_from_row(row, active=True, now=now)
+        for row in active_rows
+    )
+
+    for session in sessions:
+        segment_start_local = max(
+            session["started_at"].astimezone(LOCAL_TIMEZONE),
+            first_day_local,
+        )
+        segment_end_local = min(
+            session["effective_end"].astimezone(LOCAL_TIMEZONE),
+            now_local,
+        )
+        if segment_end_local <= segment_start_local:
+            continue
+
+        cursor = segment_start_local
+        while cursor < segment_end_local:
+            next_day = start_of_local_day(cursor) + timedelta(days=1)
+            chunk_end = min(next_day, segment_end_local)
+            day_label = start_of_local_day(cursor).strftime("%Y-%m-%d")
+            buckets[day_label] += int((chunk_end - cursor).total_seconds())
+            cursor = chunk_end
+
+    return list(buckets.items())
+
+
+async def reconcile_active_voice_sessions() -> None:
+    """Reconcile persisted active voice sessions with the current gateway state."""
+    now = utc_now()
+    live_members: dict[tuple[int, int], tuple[discord.Member, discord.abc.GuildChannel]] = {}
+
+    for guild in bot.guilds:
+        channels = list(guild.voice_channels) + list(getattr(guild, "stage_channels", []))
+        for channel in channels:
+            for member in channel.members:
+                if member.bot:
+                    continue
+                live_members[(guild.id, member.id)] = (member, channel)
+
+    active_rows = list_active_voice_session_rows()
+    touched_keys: set[tuple[int, int]] = set()
+    closed_count = 0
+    opened_count = 0
+
+    for row in active_rows:
+        key = (row["guild_id"], row["user_id"])
+        live_state = live_members.get(key)
+
+        if live_state is None:
+            if finish_voice_session(row["guild_id"], row["user_id"], ended_at=now) is not None:
+                closed_count += 1
+            continue
+
+        member, channel = live_state
+        touched_keys.add(key)
+
+        if row["channel_id"] != channel.id:
+            if finish_voice_session(row["guild_id"], row["user_id"], ended_at=now) is not None:
+                closed_count += 1
+            start_voice_session(member, channel, started_at=now)
+            opened_count += 1
+            continue
+
+        with get_voice_db_connection() as conn:
+            conn.execute(
+                """
+                UPDATE active_voice_sessions
+                SET user_display_name = ?, channel_name = ?
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (member.display_name, channel.name, row["guild_id"], row["user_id"]),
+            )
+
+    for key, live_state in live_members.items():
+        if key in touched_keys:
+            continue
+        member, channel = live_state
+        start_voice_session(member, channel, started_at=now)
+        opened_count += 1
+
+    if closed_count or opened_count:
+        print(
+            "Reconciled voice activity state: "
+            f"closed={closed_count}, opened={opened_count}"
+        )
+
+
+def normalize_report_period(period: Optional[str], *, default: str = "week") -> str:
+    """Map user-friendly report period values to canonical tokens."""
+    normalized = (period or default).strip().lower()
+    aliases = {
+        "today": "today",
+        "day": "today",
+        "daily": "today",
+        "week": "week",
+        "weekly": "week",
+        "all": "all",
+        "alltime": "all",
+        "all-time": "all",
+    }
+    if normalized not in aliases:
+        raise ValueError("Use `today`, `week`, or `all`.")
+    return aliases[normalized]
+
+
+def get_report_period_bounds(period: str) -> tuple[str, Optional[datetime], Optional[datetime]]:
+    """Return a display label plus UTC bounds for a report period."""
+    normalized = normalize_report_period(period)
+    if normalized == "today":
+        start = start_of_local_day().astimezone(timezone.utc)
+        return "today", start, None
+    if normalized == "week":
+        start = start_of_local_week().astimezone(timezone.utc)
+        return "this week", start, None
+    return "all time", None, None
+
+
+def format_session_count(value: int) -> str:
+    """Render session count with a stable singular/plural label."""
+    suffix = "session" if value == 1 else "sessions"
+    return f"{value} {suffix}"
+
+
+async def clear_remote_global_commands_preserving_local_tree() -> int:
+    """
+    Clear remote global app commands without losing the in-memory command definitions
+    that `copy_global_to()` needs for guild sync.
+    """
+    preserved_commands = list(bot.tree.get_commands(guild=None))
+    bot.tree.clear_commands(guild=None)
+    cleared_remote = await bot.tree.sync()
+
+    for command in preserved_commands:
+        try:
+            bot.tree.add_command(command)
+        except Exception as e:
+            print(f"Failed to restore app command {command.name}: {e}")
+
+    return len(cleared_remote)
 
 # -------- Role permissions --------
 
 RELIABLE_ROLE_NAME = "Товарищ"
 _reliable_role_id_env = os.getenv("RELIABLE_ROLE_ID")
 RELIABLE_ROLE_ID = int(_reliable_role_id_env) if _reliable_role_id_env else None
+TRUSTED_ROLE_NAME = "надежный"
+_trusted_role_id_env = os.getenv("TRUSTED_ROLE_ID")
+TRUSTED_ROLE_ID = int(_trusted_role_id_env) if _trusted_role_id_env else None
+USER_MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
+USER_ID_PATTERN = re.compile(r"\b(\d{15,20})\b")
 
 
 def has_reliable_role(member: discord.Member) -> bool:
@@ -50,9 +721,454 @@ def has_reliable_role(member: discord.Member) -> bool:
     return any(role.name.casefold() == required_name for role in member.roles)
 
 
+def has_shuffle_exclusion_access(member: discord.Member) -> bool:
+    """Allow exclusion management for either the companion or trusted role."""
+    allowed_role_ids = {role_id for role_id in (RELIABLE_ROLE_ID, TRUSTED_ROLE_ID) if role_id is not None}
+    if allowed_role_ids and any(role.id in allowed_role_ids for role in member.roles):
+        return True
+
+    allowed_role_names = {
+        RELIABLE_ROLE_NAME.casefold(),
+        TRUSTED_ROLE_NAME.casefold(),
+    }
+    return any(role.name.casefold() in allowed_role_names for role in member.roles)
+
+
+def get_shuffle_exclusion_access_label() -> str:
+    """Return a readable role requirement label for user-facing errors."""
+    return f"`{RELIABLE_ROLE_NAME}` or `{TRUSTED_ROLE_NAME}`"
+
+
+def resolve_excluded_members(
+    guild: discord.Guild,
+    raw_value: str,
+    *,
+    allow_unknown_ids: bool = False,
+) -> tuple[set[int], list[str]]:
+    """Resolve mentions, IDs, or exact names into a set of member IDs."""
+    resolved_member_ids: set[int] = set()
+    unresolved: list[str] = []
+    remaining = raw_value.strip()
+
+    for match in USER_MENTION_PATTERN.finditer(remaining):
+        user_id = int(match.group(1))
+        member = guild.get_member(user_id)
+        if member is None or member.bot:
+            unresolved.append(match.group(0))
+            continue
+        resolved_member_ids.add(member.id)
+    remaining = USER_MENTION_PATTERN.sub(" ", remaining)
+
+    for match in USER_ID_PATTERN.finditer(remaining):
+        user_id = int(match.group(1))
+        member = guild.get_member(user_id)
+        if member is None:
+            if allow_unknown_ids:
+                resolved_member_ids.add(user_id)
+                continue
+            unresolved.append(match.group(1))
+            continue
+        if member.bot:
+            unresolved.append(match.group(1))
+            continue
+        resolved_member_ids.add(member.id)
+    remaining = USER_ID_PATTERN.sub(" ", remaining)
+
+    for token in [part.strip() for part in re.split(r"[,;\n]+", remaining) if part.strip()]:
+        token_cf = token.casefold()
+        matches = [
+            member
+            for member in guild.members
+            if not member.bot
+            and (
+                member.display_name.casefold() == token_cf
+                or member.name.casefold() == token_cf
+                or str(member).casefold() == token_cf
+            )
+        ]
+        if len(matches) == 1:
+            resolved_member_ids.add(matches[0].id)
+            continue
+        if len(matches) > 1:
+            unresolved.append(f"{token} (ambiguous)")
+            continue
+        unresolved.append(token)
+
+    return resolved_member_ids, unresolved
+
+
+def load_persistent_shuffle_exclusions() -> dict[int, set[int]]:
+    """Load guild-level persistent shuffle exclusions from disk."""
+    try:
+        with open(PERSISTENT_EXCLUSIONS_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Failed to load persistent shuffle exclusions: {e}")
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[int, set[int]] = {}
+    for guild_id, user_ids in raw.items():
+        try:
+            guild_id_int = int(guild_id)
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(user_ids, list):
+            continue
+
+        normalized_user_ids: set[int] = set()
+        for user_id in user_ids:
+            try:
+                normalized_user_ids.add(int(user_id))
+            except (TypeError, ValueError):
+                continue
+
+        if normalized_user_ids:
+            loaded[guild_id_int] = normalized_user_ids
+
+    return loaded
+
+
+def save_persistent_shuffle_exclusions() -> None:
+    """Persist guild-level shuffle exclusions to disk."""
+    serializable = {
+        str(guild_id): sorted(user_ids)
+        for guild_id, user_ids in persistent_shuffle_exclusions.items()
+        if user_ids
+    }
+
+    try:
+        with open(PERSISTENT_EXCLUSIONS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(serializable, fh, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"Failed to save persistent shuffle exclusions: {e}")
+
+
+def get_persistent_excluded_member_ids(guild_id: int) -> set[int]:
+    """Return the persistent exclusion set for one guild."""
+    return set(persistent_shuffle_exclusions.get(guild_id, set()))
+
+
+def add_persistent_excluded_members(guild_id: int, member_ids: set[int]) -> int:
+    """Add members to the guild-level persistent shuffle exclusions."""
+    current = persistent_shuffle_exclusions.setdefault(guild_id, set())
+    before_count = len(current)
+    current.update(member_ids)
+    if current:
+        persistent_shuffle_exclusions[guild_id] = current
+    save_persistent_shuffle_exclusions()
+    return len(current) - before_count
+
+
+def remove_persistent_excluded_members(guild_id: int, member_ids: set[int]) -> int:
+    """Remove members from the guild-level persistent shuffle exclusions."""
+    current = persistent_shuffle_exclusions.get(guild_id)
+    if not current:
+        return 0
+
+    before_count = len(current)
+    current.difference_update(member_ids)
+    removed_count = before_count - len(current)
+    if current:
+        persistent_shuffle_exclusions[guild_id] = current
+    else:
+        persistent_shuffle_exclusions.pop(guild_id, None)
+    save_persistent_shuffle_exclusions()
+    return removed_count
+
+
+def format_member_list(guild: discord.Guild, member_ids: set[int]) -> str:
+    """Render a stable, readable list of members from IDs."""
+    names = []
+    for user_id in sorted(member_ids):
+        member = guild.get_member(user_id)
+        names.append(member.display_name if member else f"Unknown user ({user_id})")
+    return ", ".join(names)
+
+
+def load_shuffle_settings() -> dict[int, dict[str, bool]]:
+    """Load guild-level shuffle behavior settings from disk."""
+    try:
+        with open(SHUFFLE_SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Failed to load shuffle settings: {e}")
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[int, dict[str, bool]] = {}
+    for guild_id, settings in raw.items():
+        try:
+            guild_id_int = int(guild_id)
+        except (TypeError, ValueError):
+            continue
+
+        if not isinstance(settings, dict):
+            continue
+
+        loaded[guild_id_int] = {
+            "allow_hot_joiners": bool(settings.get("allow_hot_joiners", True)),
+            "require_camera": bool(settings.get("require_camera", False)),
+        }
+
+    return loaded
+
+
+def save_shuffle_settings() -> None:
+    """Persist guild-level shuffle behavior settings to disk."""
+    serializable = {
+        str(guild_id): settings
+        for guild_id, settings in shuffle_settings.items()
+        if settings
+    }
+
+    try:
+        with open(SHUFFLE_SETTINGS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(serializable, fh, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"Failed to save shuffle settings: {e}")
+
+
+def get_allow_hot_joiners(guild_id: int) -> bool:
+    """Return whether brand-new joiners should be added to active shuffles."""
+    return bool(shuffle_settings.get(guild_id, {}).get("allow_hot_joiners", True))
+
+
+def set_allow_hot_joiners(guild_id: int, enabled: bool) -> None:
+    """Persist the hot-joiner behavior toggle for one guild."""
+    guild_settings = dict(shuffle_settings.get(guild_id, {}))
+    guild_settings["allow_hot_joiners"] = bool(enabled)
+    shuffle_settings[guild_id] = guild_settings
+    save_shuffle_settings()
+
+
+def get_require_camera_for_shuffles(guild_id: int) -> bool:
+    """Return whether active/future shuffles should enforce camera usage."""
+    return bool(shuffle_settings.get(guild_id, {}).get("require_camera", False))
+
+
+def set_require_camera_for_shuffles(guild_id: int, enabled: bool) -> None:
+    """Persist the shuffle camera enforcement toggle for one guild."""
+    guild_settings = dict(shuffle_settings.get(guild_id, {}))
+    guild_settings.setdefault("allow_hot_joiners", True)
+    guild_settings["require_camera"] = bool(enabled)
+    shuffle_settings[guild_id] = guild_settings
+    save_shuffle_settings()
+
+
+def append_shuffle_audit_log(
+    *,
+    action: str,
+    guild: Optional[discord.Guild],
+    actor: Optional[discord.Member],
+    channel_id: Optional[int] = None,
+    details: Optional[dict] = None,
+) -> None:
+    """Append one JSONL audit record for exclusion-related operations."""
+    record = {
+        "timestamp": utc_now().isoformat(),
+        "action": action,
+        "guild_id": guild.id if guild else None,
+        "guild_name": guild.name if guild else None,
+        "actor_id": actor.id if actor else None,
+        "actor_name": str(actor) if actor else None,
+        "actor_display_name": actor.display_name if actor else None,
+        "channel_id": channel_id,
+        "details": details or {},
+    }
+
+    try:
+        with open(SHUFFLE_AUDIT_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Failed to write shuffle audit log: {e}")
+
+    print(f"Shuffle audit: {json.dumps(record, ensure_ascii=False)}")
+
+
 def is_frozen_event(event: discord.ScheduledEvent) -> bool:
     """Frozen events must not auto-post notices or run shuffles."""
     return FROZEN_EVENT_MARKER in event.name.casefold()
+
+
+async def maybe_delete_thread_created_message(message: discord.Message) -> bool:
+    """Delete Discord's automatic 'thread created' system message when possible."""
+    if message.type is not discord.MessageType.thread_created:
+        return False
+
+    try:
+        await message.delete()
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        print(
+            "Cannot delete thread-created system message "
+            f"{message.id} in channel {message.channel.id}: missing permissions"
+        )
+    except discord.HTTPException as e:
+        print(f"Failed to delete thread-created system message {message.id}: {e}")
+
+    return True
+
+
+def make_event_target_key(event_id: int, start_time: Optional[datetime]) -> str:
+    """Build a stable storage key for one event occurrence."""
+    start_ts = int(start_time.timestamp()) if start_time else 0
+    return f"{event_id}:{start_ts}"
+
+
+def load_event_text_channel_targets() -> dict[str, int]:
+    """Load saved event/occurrence -> text channel bindings from disk."""
+    try:
+        with open(EVENT_TARGETS_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Failed to load event text-channel targets: {e}")
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[str, int] = {}
+    for event_key, channel_id in raw.items():
+        try:
+            loaded[str(event_key)] = int(channel_id)
+        except (TypeError, ValueError):
+            continue
+    return loaded
+
+
+def save_event_text_channel_targets() -> None:
+    """Persist event -> text channel bindings to disk."""
+    try:
+        with open(EVENT_TARGETS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(event_text_channel_targets, fh, indent=2, sort_keys=True)
+    except Exception as e:
+        print(f"Failed to save event text-channel targets: {e}")
+
+
+def remember_event_text_channel(
+    event_id: int,
+    text_channel_id: int,
+    *,
+    start_time: Optional[datetime],
+) -> None:
+    """Persist the text channel chosen for one event occurrence."""
+    key = make_event_target_key(event_id, start_time)
+    event_text_channel_targets[key] = text_channel_id
+    save_event_text_channel_targets()
+    print(
+        f"Saved shuffle target channel {text_channel_id} "
+        f"for event occurrence {key}"
+    )
+
+
+def forget_event_text_channel(event_id: int, start_time: Optional[datetime]) -> None:
+    """Forget a saved text channel for one event occurrence."""
+    key = make_event_target_key(event_id, start_time)
+    if event_text_channel_targets.pop(key, None) is not None:
+        save_event_text_channel_targets()
+        print(f"Removed saved shuffle target for event occurrence {key}")
+
+
+def move_event_text_channel_target(
+    event_id: int,
+    before_start_time: Optional[datetime],
+    after_start_time: Optional[datetime],
+) -> None:
+    """Move a saved channel binding when an occurrence is rescheduled."""
+    before_key = make_event_target_key(event_id, before_start_time)
+    after_key = make_event_target_key(event_id, after_start_time)
+    if before_key == after_key or after_key in event_text_channel_targets:
+        return
+
+    channel_id = event_text_channel_targets.pop(before_key, None)
+    if channel_id is None:
+        return
+
+    event_text_channel_targets[after_key] = channel_id
+    save_event_text_channel_targets()
+    print(f"Moved saved shuffle target from {before_key} to {after_key}")
+
+
+def resolve_message_channel(
+    guild: discord.Guild,
+    channel_id: int,
+) -> Optional[discord.abc.Messageable]:
+    """Resolve a text-capable guild channel or thread by ID."""
+    channel = None
+    get_channel_or_thread = getattr(guild, "get_channel_or_thread", None)
+    if callable(get_channel_or_thread):
+        channel = get_channel_or_thread(channel_id)
+    if channel is None:
+        channel = guild.get_channel(channel_id)
+    if channel is None:
+        get_thread = getattr(guild, "get_thread", None)
+        if callable(get_thread):
+            channel = get_thread(channel_id)
+    return channel
+
+
+def is_message_channel(channel) -> bool:
+    """Return True for channels/threads we can post shuffle messages into."""
+    return channel is not None and callable(getattr(channel, "send", None))
+
+
+async def fetch_message_channel(
+    guild: discord.Guild,
+    channel_id: int,
+) -> Optional[discord.abc.Messageable]:
+    """
+    Resolve a text-capable channel or thread, falling back to the API when the cache
+    is cold (common after restarts or for threads).
+    """
+    channel = resolve_message_channel(guild, channel_id)
+    if is_message_channel(channel):
+        return channel
+
+    try:
+        channel = await bot.fetch_channel(channel_id)
+    except discord.NotFound:
+        return None
+    except discord.Forbidden:
+        print(
+            f"Cannot access saved message channel {channel_id} in guild {guild.id}: "
+            "missing permissions"
+        )
+        return None
+    except discord.HTTPException as e:
+        print(f"Failed to fetch saved message channel {channel_id}: {e}")
+        return None
+
+    if getattr(channel, "guild", None) is not None and channel.guild.id != guild.id:
+        print(
+            f"Saved message channel {channel_id} belongs to guild "
+            f"{channel.guild.id}, expected {guild.id}"
+        )
+        return None
+
+    if is_message_channel(channel):
+        return channel
+
+    print(f"Saved channel {channel_id} is not text-capable: {type(channel).__name__}")
+    return None
+
+
+event_text_channel_targets.update(load_event_text_channel_targets())
+persistent_shuffle_exclusions.update(load_persistent_shuffle_exclusions())
+shuffle_settings.update(load_shuffle_settings())
+init_voice_tracking_db()
 
 
 # -------- Events --------
@@ -60,11 +1176,31 @@ def is_frozen_event(event: discord.ScheduledEvent) -> bool:
 @bot.event
 async def on_ready():
     print(f'{bot.user} connected. Guilds: {len(bot.guilds)}')
-    try:
-        synced = await bot.tree.sync()
-        print(f'Synced {len(synced)} command(s) globally')
-    except Exception as e:
-        print(f'Failed to sync commands: {e}')
+    print(f"Runtime data dir: {DATA_DIR}")
+    if USE_GUILD_ONLY_APP_COMMANDS:
+        try:
+            cleared_count = await clear_remote_global_commands_preserving_local_tree()
+            print(f"Cleared global app commands. Remaining global count: {cleared_count}")
+        except Exception as e:
+            print(f"Failed to clear global app commands: {e}")
+    else:
+        try:
+            synced = await bot.tree.sync()
+            print(f'Synced {len(synced)} command(s) globally')
+        except Exception as e:
+            print(f'Failed to sync commands: {e}')
+
+    for guild in bot.guilds:
+        try:
+            bot.tree.clear_commands(guild=guild)
+            bot.tree.copy_global_to(guild=guild)
+            guild_synced = await bot.tree.sync(guild=guild)
+            print(
+                f"Synced {len(guild_synced)} command(s) to guild "
+                f"{guild.name} ({guild.id})"
+            )
+        except Exception as e:
+            print(f"Failed to sync commands to guild {guild.id}: {e}")
 
     # Do not replay shuffles for events that were already active before startup.
     # A restart clears in-memory dedupe state, so we only mark those occurrences
@@ -94,7 +1230,12 @@ async def on_ready():
                 if not isinstance(voice_channel, discord.VoiceChannel):
                     continue
 
-                text_channel = pick_text_channel_for_voice(voice_channel)
+                text_channel = await pick_saved_or_linked_text_channel(
+                    guild,
+                    ev.id,
+                    voice_channel,
+                    ev.start_time,
+                )
                 if text_channel is None:
                     continue
 
@@ -107,12 +1248,48 @@ async def on_ready():
                     text_channel.id,
                 )
 
+    await reconcile_active_voice_sessions()
+
 
 @bot.event
 async def on_message(message: discord.Message):
+    if await maybe_delete_thread_created_message(message):
+        return
     if message.author == bot.user:
         return
     await bot.process_commands(message)
+
+
+@bot.event
+async def on_command_error(ctx: commands.Context, error: commands.CommandError):
+    """Log command failures and return a visible error instead of timing out."""
+    if isinstance(error, commands.CommandNotFound):
+        return
+
+    original = getattr(error, "original", error)
+    print("Command error:")
+    print("".join(traceback.format_exception(type(original), original, original.__traceback__)))
+
+    if ctx.interaction is not None:
+        await finish_hybrid_command(ctx, f"Command failed: `{original}`")
+        return
+
+    try:
+        await ctx.send(f"Command failed: `{original}`")
+    except Exception as send_error:
+        print(f"Failed to send command error message: {send_error}")
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: discord.app_commands.AppCommandError,
+):
+    """Log slash command failures and answer the interaction with the exception."""
+    original = getattr(error, "original", error)
+    print("App command error:")
+    print("".join(traceback.format_exception(type(original), original, original.__traceback__)))
+    await send_interaction_error(interaction, f"Slash command failed: `{original}`")
 
 
 @bot.event
@@ -121,6 +1298,7 @@ async def on_guild_scheduled_event_update(before, after):
     before_key = event_occurrence_key(before.id, before.start_time)
     after_key = event_occurrence_key(after.id, after.start_time)
     if before_key != after_key:
+        move_event_text_channel_target(before.id, before.start_time, after.start_time)
         task = scheduled_event_tasks.pop(before_key, None)
         if task is not None:
             task.cancel()
@@ -151,7 +1329,12 @@ async def on_guild_scheduled_event_update(before, after):
     ):
         voice_channel = after.guild.get_channel(after.channel_id) if after.channel_id else None
         if isinstance(voice_channel, discord.VoiceChannel):
-            text_channel = pick_text_channel_for_voice(voice_channel)
+            text_channel = await pick_saved_or_linked_text_channel(
+                after.guild,
+                after.id,
+                voice_channel,
+                after.start_time,
+            )
             if text_channel is not None:
                 end_time = after.end_time or (after.start_time + timedelta(hours=2))
                 schedule_event_lifecycle(
@@ -203,6 +1386,43 @@ def pick_text_channel_for_voice(
         return guild.text_channels[0]
 
     return None
+
+
+async def pick_saved_or_linked_text_channel(
+    guild: discord.Guild,
+    event_id: int,
+    voice_channel: discord.VoiceChannel,
+    start_time: Optional[datetime],
+) -> Optional[discord.abc.Messageable]:
+    """Prefer the saved event target channel, then fall back to voice-linked lookup."""
+    target_keys = [make_event_target_key(event_id, start_time), str(event_id)]
+    for target_key in target_keys:
+        saved_channel_id = event_text_channel_targets.get(target_key)
+        if saved_channel_id is None:
+            continue
+
+        saved_channel = await fetch_message_channel(guild, saved_channel_id)
+        if saved_channel is not None:
+            print(
+                f"Using saved shuffle target channel {saved_channel_id} "
+                f"for event key {target_key}"
+            )
+            return saved_channel
+
+        print(
+            f"Saved text channel {saved_channel_id} for event key {target_key} "
+            "is no longer available"
+        )
+        event_text_channel_targets.pop(target_key, None)
+        save_event_text_channel_targets()
+
+    fallback_channel = pick_text_channel_for_voice(voice_channel)
+    if fallback_channel is not None:
+        print(
+            f"No saved shuffle target for event {event_id}; "
+            f"falling back to linked text channel {fallback_channel.id}"
+        )
+    return fallback_channel
 
 
 def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple[int, int]:
@@ -336,7 +1556,7 @@ def schedule_event_lifecycle(
             if guild_obj is None:
                 return
 
-            text_channel = guild_obj.get_channel(text_channel_id)
+            text_channel = await fetch_message_channel(guild_obj, text_channel_id)
             if text_channel is None:
                 return
 
@@ -415,6 +1635,7 @@ def schedule_event_lifecycle(
         finally:
             if scheduled_event_tasks.get(key) is asyncio.current_task():
                 scheduled_event_tasks.pop(key, None)
+                forget_event_text_channel(event_id, start_time)
 
     task = bot.loop.create_task(run_event_lifecycle())
     scheduled_event_tasks[key] = task
@@ -466,7 +1687,14 @@ async def trigger_shuffle_for_event(
             print(f"Event {event.id} has no valid voice channel")
             return
 
-        text_channel = preferred_text_channel or pick_text_channel_for_voice(voice_channel)
+        text_channel = preferred_text_channel
+        if text_channel is None:
+            text_channel = await pick_saved_or_linked_text_channel(
+                guild,
+                event.id,
+                voice_channel,
+                event.start_time,
+            )
         if text_channel is None:
             print(f"No text channel found for voice channel {voice_channel.id}")
             return
@@ -489,12 +1717,24 @@ async def trigger_shuffle_for_event(
         triggering_event_occurrences.discard(key)
 
 
-def build_content(guild: discord.Guild, order, labels=None) -> str:
+def build_content(
+    guild: discord.Guild,
+    order,
+    labels=None,
+    excluded_member_ids: Optional[set[int]] = None,
+    allow_hot_joiners: bool = True,
+    require_camera: bool = False,
+) -> str:
     """Build the visual text of the shuffled list, using custom labels if present."""
     if labels is None:
         labels = {}
+    if excluded_member_ids is None:
+        excluded_member_ids = set()
 
     lines = [SHUFFLE_LIST_PREFIX]
+    lines.append(f"Hot joiners: {'on' if allow_hot_joiners else 'off'}")
+    if require_camera:
+        lines.append("Camera check: on")
     for i, user_id in enumerate(order, 1):
         member = guild.get_member(user_id)
         base = member.display_name if member else f"Unknown user ({user_id})"
@@ -511,7 +1751,40 @@ def build_content(guild: discord.Guild, order, labels=None) -> str:
             else:
                 shown = f"@{shown}"
         lines.append(f"{i}. {shown}")
+
+    if excluded_member_ids:
+        excluded_names = []
+        for user_id in sorted(excluded_member_ids):
+            member = guild.get_member(user_id)
+            excluded_names.append(member.display_name if member else f"Unknown user ({user_id})")
+        lines.append("")
+        lines.append(f"Excluded: {', '.join(excluded_names)}")
+
     return "\n".join(lines)
+
+
+def build_shuffle_member_label(
+    member: discord.Member,
+    *,
+    hot_joiner: bool = False,
+    returned: bool = False,
+) -> str:
+    """Build a shuffle label with stable status markers."""
+    markers = []
+    if hot_joiner:
+        markers.append("✨")
+    if returned:
+        markers.append("🌌")
+    if not markers:
+        return member.display_name
+    return f"{member.display_name} {' '.join(markers)}"
+
+
+def is_shuffle_hot_joiner(state: dict, member_id: int) -> bool:
+    """Return whether a member joined after this shuffle was posted."""
+    if member_id in state.get("hot_joiner_member_ids", set()):
+        return True
+    return "✨" in state.get("labels", {}).get(member_id, "")
 
 
 async def update_shuffle_message(state: dict) -> None:
@@ -520,7 +1793,14 @@ async def update_shuffle_message(state: dict) -> None:
     if not guild:
         return
 
-    content = build_content(guild, state["order"], state.get("labels"))
+    content = build_content(
+        guild,
+        state["order"],
+        state.get("labels"),
+        state.get("ignored_excluded_member_ids", set()),
+        state.get("allow_hot_joiners", True),
+        state.get("require_camera", False),
+    )
     try:
         await state["message"].edit(content=content)
     except discord.NotFound:
@@ -528,6 +1808,312 @@ async def update_shuffle_message(state: dict) -> None:
         active_shuffles.pop(state["text_channel_id"], None)
     except Exception as e:
         print(f"Error editing message: {e}")
+
+
+async def refresh_active_shuffle_exclusions(guild_id: int) -> None:
+    """Recompute effective exclusions for active shuffles in one guild."""
+    persistent_ids = get_persistent_excluded_member_ids(guild_id)
+
+    for state in list(active_shuffles.values()):
+        if state["guild_id"] != guild_id:
+            continue
+
+        manual_ids = set(state.get("manual_excluded_member_ids", set()))
+        effective_ids = persistent_ids.union(manual_ids)
+        changed = effective_ids != state.get("excluded_member_ids", set())
+        state["excluded_member_ids"] = effective_ids
+        ignored_ids = set(state.get("ignored_excluded_member_ids", set()))
+        ignored_ids.intersection_update(effective_ids)
+
+        removed_any = False
+        for user_id in list(state["order"]):
+            if user_id not in effective_ids:
+                continue
+            state["order"].remove(user_id)
+            state.get("labels", {}).pop(user_id, None)
+            pending = state["pending_removals"].pop(user_id, None)
+            if pending:
+                pending.cancel()
+            ignored_ids.add(user_id)
+            removed_any = True
+
+        guild = bot.get_guild(state["guild_id"])
+        voice_channel = guild.get_channel(state["voice_channel_id"]) if guild else None
+        if voice_channel is not None:
+            ignored_ids.update(
+                member.id
+                for member in voice_channel.members
+                if not member.bot and member.id in effective_ids
+            )
+
+        ignored_changed = ignored_ids != state.get("ignored_excluded_member_ids", set())
+        state["ignored_excluded_member_ids"] = ignored_ids
+
+        if changed or removed_any or ignored_changed:
+            await update_shuffle_message(state)
+
+
+async def refresh_active_shuffle_settings(guild_id: int) -> None:
+    """Push guild-level shuffle settings into active shuffles for one guild."""
+    allow_hot_joiners = get_allow_hot_joiners(guild_id)
+
+    for state in list(active_shuffles.values()):
+        if state["guild_id"] != guild_id:
+            continue
+
+        if state.get("allow_hot_joiners", True) == allow_hot_joiners:
+            continue
+
+        state["allow_hot_joiners"] = allow_hot_joiners
+        await update_shuffle_message(state)
+
+
+def get_shuffle_camera_source(text_channel_id: int) -> str:
+    """Return the source token used by a shuffle message's camera enforcement."""
+    return f"{CAMERA_SOURCE_SHUFFLE_PREFIX}{text_channel_id}"
+
+
+def is_camera_on(voice_state) -> bool:
+    """Return whether Discord reports the member's camera as enabled."""
+    return bool(getattr(voice_state, "self_video", False))
+
+
+def cancel_camera_kick(state: dict, member_id: int) -> bool:
+    """Cancel a pending camera kick timer for one member."""
+    pending = state.get("pending_kicks", {}).pop(member_id, None)
+    if pending:
+        pending.cancel()
+        return True
+    return False
+
+
+def start_camera_enforcement(
+    guild: discord.Guild,
+    voice_channel: discord.abc.GuildChannel,
+    text_channel: Optional[discord.abc.Messageable] = None,
+    *,
+    source: str = CAMERA_SOURCE_MANUAL,
+) -> tuple[dict, bool]:
+    """Start or extend camera enforcement for one voice channel."""
+    key = (guild.id, voice_channel.id)
+    state = active_camera_enforcements.get(key)
+    created = state is None
+    if state is None:
+        state = {
+            "guild_id": guild.id,
+            "voice_channel_id": voice_channel.id,
+            "text_channel_id": getattr(text_channel, "id", None),
+            "sources": set(),
+            "pending_kicks": {},
+        }
+        active_camera_enforcements[key] = state
+    elif text_channel is not None and state.get("text_channel_id") is None:
+        state["text_channel_id"] = getattr(text_channel, "id", None)
+
+    state["sources"].add(source)
+
+    for voice_member in getattr(voice_channel, "members", []):
+        update_camera_enforcement_for_member(voice_member, voice_channel.id)
+
+    return state, created
+
+
+def stop_camera_enforcement(
+    guild_id: int,
+    voice_channel_id: int,
+    *,
+    source: Optional[str] = None,
+) -> bool:
+    """Stop camera enforcement, either entirely or for one source token."""
+    key = (guild_id, voice_channel_id)
+    state = active_camera_enforcements.get(key)
+    if state is None:
+        return False
+
+    if source is None:
+        state["sources"].clear()
+    else:
+        state["sources"].discard(source)
+
+    if state["sources"]:
+        return False
+
+    active_camera_enforcements.pop(key, None)
+    for task in list(state.get("pending_kicks", {}).values()):
+        task.cancel()
+    state.get("pending_kicks", {}).clear()
+    return True
+
+
+def update_camera_enforcement_for_member(
+    member: discord.Member,
+    voice_channel_id: int,
+) -> None:
+    """Schedule or cancel camera enforcement for a member in one voice channel."""
+    if member.bot:
+        return
+
+    state = active_camera_enforcements.get((member.guild.id, voice_channel_id))
+    if state is None:
+        return
+
+    member_voice = member.voice
+    in_enforced_channel = (
+        member_voice is not None
+        and member_voice.channel is not None
+        and member_voice.channel.id == voice_channel_id
+    )
+
+    if not in_enforced_channel or is_camera_on(member_voice):
+        cancel_camera_kick(state, member.id)
+        return
+
+    pending = state["pending_kicks"].get(member.id)
+    if pending and not pending.done():
+        return
+
+    state["pending_kicks"][member.id] = asyncio.create_task(
+        camera_kick_after_grace(member.guild.id, voice_channel_id, member.id)
+    )
+
+
+def handle_camera_voice_state_update(member: discord.Member, before, after) -> None:
+    """Apply camera enforcement to any enforced channel touched by this update."""
+    affected_channel_ids: set[int] = set()
+    before_channel = before.channel if is_trackable_voice_channel(before.channel) else None
+    after_channel = after.channel if is_trackable_voice_channel(after.channel) else None
+
+    if before_channel is not None:
+        affected_channel_ids.add(before_channel.id)
+    if after_channel is not None:
+        affected_channel_ids.add(after_channel.id)
+
+    for voice_channel_id in affected_channel_ids:
+        update_camera_enforcement_for_member(member, voice_channel_id)
+
+
+async def send_camera_enforcement_notice(state: dict, message: str) -> None:
+    """Best-effort notification for camera enforcement actions."""
+    text_channel_id = state.get("text_channel_id")
+    if text_channel_id is None:
+        return
+
+    channel = bot.get_channel(text_channel_id)
+    if channel is None or not hasattr(channel, "send"):
+        return
+
+    try:
+        await channel.send(message)
+    except Exception as e:
+        print(f"Failed to send camera enforcement notice: {e}")
+
+
+async def camera_kick_after_grace(
+    guild_id: int,
+    voice_channel_id: int,
+    member_id: int,
+) -> None:
+    """Disconnect a member if their camera remains off for the full grace period."""
+    try:
+        await asyncio.sleep(CAMERA_GRACE_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+    state = active_camera_enforcements.get((guild_id, voice_channel_id))
+    if state is None:
+        return
+
+    try:
+        guild = bot.get_guild(guild_id)
+        member = guild.get_member(member_id) if guild else None
+        if member is None or member.bot:
+            return
+
+        member_voice = member.voice
+        if (
+            member_voice is None
+            or member_voice.channel is None
+            or member_voice.channel.id != voice_channel_id
+            or is_camera_on(member_voice)
+        ):
+            return
+
+        channel_name = member_voice.channel.name
+        await member.move_to(
+            None,
+            reason=f"Camera was off for more than {CAMERA_GRACE_SECONDS} seconds",
+        )
+        await send_camera_enforcement_notice(
+            state,
+            f"Disconnected **{member.display_name}** from `{channel_name}` "
+            f"because their camera stayed off for {CAMERA_GRACE_SECONDS} seconds.",
+        )
+    except discord.Forbidden:
+        await send_camera_enforcement_notice(
+            state,
+            "I could not disconnect a member for camera enforcement. "
+            "I need the `Move Members` permission and a high enough role.",
+        )
+    except Exception as e:
+        print(f"Error during camera enforcement kick: {e}")
+    finally:
+        current_state = active_camera_enforcements.get((guild_id, voice_channel_id))
+        if current_state is not None:
+            current_state.get("pending_kicks", {}).pop(member_id, None)
+
+
+async def refresh_active_shuffle_camera_enforcement(guild_id: int) -> None:
+    """Start or stop camera enforcement for all active shuffles in one guild."""
+    require_camera = get_require_camera_for_shuffles(guild_id)
+    guild = bot.get_guild(guild_id)
+
+    for state in list(active_shuffles.values()):
+        if state["guild_id"] != guild_id:
+            continue
+
+        source = get_shuffle_camera_source(state["text_channel_id"])
+        if guild is not None:
+            voice_channel = guild.get_channel(state["voice_channel_id"])
+        else:
+            voice_channel = None
+
+        if require_camera and voice_channel is not None:
+            start_camera_enforcement(
+                guild,
+                voice_channel,
+                getattr(state.get("message"), "channel", None),
+                source=source,
+            )
+        else:
+            stop_camera_enforcement(
+                state["guild_id"],
+                state["voice_channel_id"],
+                source=source,
+            )
+
+        if state.get("require_camera", False) != require_camera:
+            state["require_camera"] = require_camera
+            await update_shuffle_message(state)
+
+
+def format_camera_enforcement_sources(sources: set[str]) -> str:
+    """Render camera enforcement source tokens for status output."""
+    labels = []
+    if CAMERA_SOURCE_MANUAL in sources:
+        labels.append("manual")
+    if any(source.startswith(CAMERA_SOURCE_SHUFFLE_PREFIX) for source in sources):
+        labels.append("shuffle")
+    return ", ".join(labels) if labels else "unknown"
+
+
+def bot_can_move_members(guild: discord.Guild, voice_channel: discord.abc.GuildChannel) -> bool:
+    """Return whether the bot can disconnect members from a voice channel."""
+    bot_member = guild.me
+    if bot_member is None and bot.user is not None:
+        bot_member = guild.get_member(bot.user.id)
+    if bot_member is None or not hasattr(voice_channel, "permissions_for"):
+        return False
+    return bool(voice_channel.permissions_for(bot_member).move_members)
 
 
 async def schedule_removal(text_channel_id: int, member_id: int) -> None:
@@ -580,22 +2166,41 @@ async def start_shuffle_for_channel(
     text_channel: discord.abc.Messageable,
     *,
     existing_message: Optional[discord.Message] = None,
+    excluded_member_ids: Optional[set[int]] = None,
 ) -> None:
     """
     Common shuffle logic:
     - used in the /shuffle command
     - and when a scheduled event auto-starts.
     """
-    members = [m for m in voice_channel.members if not m.bot]
+    manual_excluded_member_ids = set(excluded_member_ids or set())
+    excluded_member_ids = get_persistent_excluded_member_ids(guild.id).union(
+        manual_excluded_member_ids
+    )
+    ignored_excluded_member_ids = {
+        m.id for m in voice_channel.members
+        if not m.bot and m.id in excluded_member_ids
+    }
+    allow_hot_joiners = get_allow_hot_joiners(guild.id)
+    require_camera = get_require_camera_for_shuffles(guild.id)
+    members = [
+        m for m in voice_channel.members
+        if not m.bot and m.id not in excluded_member_ids
+    ]
 
     if not members:
+        empty_message = (
+            "No eligible members left in the voice channel after exclusions!"
+            if ignored_excluded_member_ids else
+            "No members in the voice channel!"
+        )
         if existing_message is not None:
             try:
-                await existing_message.edit(content="No members in the voice channel!")
+                await existing_message.edit(content=empty_message)
             except discord.NotFound:
-                await text_channel.send("No members in the voice channel!")
+                await text_channel.send(empty_message)
         else:
-            await text_channel.send("No members in the voice channel!")
+            await text_channel.send(empty_message)
         return
 
     order = [m.id for m in members]
@@ -603,7 +2208,14 @@ async def start_shuffle_for_channel(
 
     labels: dict[int, str] = {}  # labels for ✨ / 🌌
 
-    content = build_content(guild, order, labels)
+    content = build_content(
+        guild,
+        order,
+        labels,
+        ignored_excluded_member_ids,
+        allow_hot_joiners,
+        require_camera,
+    )
     if existing_message is not None:
         try:
             await existing_message.edit(content=content)
@@ -623,10 +2235,24 @@ async def start_shuffle_for_channel(
         "pending_removals": {},        # member_id -> asyncio.Task
         "labels": labels,              # custom labels (with emojis)
         "ever_seen": set(order),       # who has ever been in the list
+        "hot_joiner_member_ids": set(),
+        "manual_excluded_member_ids": manual_excluded_member_ids,
+        "excluded_member_ids": excluded_member_ids,
+        "ignored_excluded_member_ids": ignored_excluded_member_ids,
+        "allow_hot_joiners": allow_hot_joiners,
+        "require_camera": require_camera,
     }
 
-    # auto cleanup after 5 minutes
-    asyncio.create_task(cleanup_old_shuffle(text_channel.id, 300))
+    if require_camera:
+        start_camera_enforcement(
+            guild,
+            voice_channel,
+            text_channel,
+            source=get_shuffle_camera_source(text_channel.id),
+        )
+
+    # Keep the shuffle live long enough for late joiners to be added.
+    asyncio.create_task(cleanup_old_shuffle(text_channel.id, SHUFFLE_TRACKING_WINDOW))
 
 
 async def cleanup_old_shuffle(channel_id: int, delay_sec: int) -> None:
@@ -636,6 +2262,11 @@ async def cleanup_old_shuffle(channel_id: int, delay_sec: int) -> None:
     if state:
         for task in state["pending_removals"].values():
             task.cancel()
+        stop_camera_enforcement(
+            state["guild_id"],
+            state["voice_channel_id"],
+            source=get_shuffle_camera_source(channel_id),
+        )
 
 
 async def defer_hybrid_command(ctx: commands.Context) -> None:
@@ -646,18 +2277,44 @@ async def defer_hybrid_command(ctx: commands.Context) -> None:
     await ctx.defer(ephemeral=True)
 
 
-async def finish_hybrid_command(ctx: commands.Context, content: str) -> None:
-    """Finish a deferred slash invocation with an ephemeral confirmation."""
+async def send_hybrid_response(
+    ctx: commands.Context,
+    content: str,
+    *,
+    ephemeral: bool = False,
+) -> None:
+    """Send a response that works for both prefix and slash invocations."""
     if ctx.interaction is None:
+        await ctx.send(content)
         return
 
+    if ctx.interaction.response.is_done():
+        await ctx.interaction.followup.send(content, ephemeral=ephemeral)
+        return
+
+    await ctx.interaction.response.send_message(content, ephemeral=ephemeral)
+
+
+async def finish_hybrid_command(ctx: commands.Context, content: str) -> None:
+    """Finish a deferred slash invocation with an ephemeral confirmation."""
     try:
-        if ctx.interaction.response.is_done():
-            await ctx.interaction.followup.send(content, ephemeral=True)
-        else:
-            await ctx.send(content, ephemeral=True)
+        await send_hybrid_response(ctx, content, ephemeral=True)
     except Exception as e:
         print(f"Error sending command followup: {e}")
+
+
+async def send_interaction_error(
+    interaction: discord.Interaction,
+    message: str,
+) -> None:
+    """Best-effort error response for slash command failures."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except Exception as send_error:
+        print(f"Failed to send interaction error response: {send_error}")
 
 
 @bot.event
@@ -667,12 +2324,37 @@ async def on_voice_state_update(member: discord.Member, before, after) -> None:
     - schedule removal when they leave
     - cancel removal and update labels when they return.
     """
+    previous_channel = before.channel if is_trackable_voice_channel(before.channel) else None
+    current_channel = after.channel if is_trackable_voice_channel(after.channel) else None
+
+    if (
+        not member.bot
+        and (
+            (previous_channel is not None and current_channel is None)
+            or (previous_channel is None and current_channel is not None)
+            or (
+                previous_channel is not None
+                and current_channel is not None
+                and previous_channel.id != current_channel.id
+            )
+        )
+    ):
+        event_time = utc_now()
+        if previous_channel is not None:
+            finish_voice_session(member.guild.id, member.id, ended_at=event_time)
+        if current_channel is not None:
+            start_voice_session(member, current_channel, started_at=event_time)
+
+    handle_camera_voice_state_update(member, before, after)
+
     for text_channel_id, state in list(active_shuffles.items()):
         guild = bot.get_guild(state["guild_id"])
         if not guild or guild.id != member.guild.id:
             continue
 
         voice_channel_id = state["voice_channel_id"]
+        excluded_member_ids = state.get("excluded_member_ids", set())
+        allow_hot_joiners = state.get("allow_hot_joiners", True)
 
         # --- MEMBER JOINED the tracked voice channel ---
         if (
@@ -680,6 +2362,22 @@ async def on_voice_state_update(member: discord.Member, before, after) -> None:
             and after.channel.id == voice_channel_id
             and (before.channel is None or before.channel.id != voice_channel_id)
         ):
+            if member.id in excluded_member_ids:
+                pending = state["pending_removals"].pop(member.id, None)
+                if pending:
+                    pending.cancel()
+                removed_from_order = False
+                if member.id in state["order"]:
+                    state["order"].remove(member.id)
+                    state.get("labels", {}).pop(member.id, None)
+                    removed_from_order = True
+                ignored_ids = state.setdefault("ignored_excluded_member_ids", set())
+                ignored_changed = member.id not in ignored_ids
+                ignored_ids.add(member.id)
+                if ignored_changed or removed_from_order:
+                    await update_shuffle_message(state)
+                continue
+
             pending = state["pending_removals"].get(member.id)
 
             # They had a removal timer -> they returned "in time"
@@ -690,21 +2388,39 @@ async def on_voice_state_update(member: discord.Member, before, after) -> None:
                 # If they are still in the list -> mark as returned with 🌌
                 if member.id in state["order"]:
                     labels = state.setdefault("labels", {})
-                    labels[member.id] = f"{member.display_name} 🌌"
+                    was_hot_joiner = is_shuffle_hot_joiner(state, member.id)
+                    if was_hot_joiner:
+                        state.setdefault("hot_joiner_member_ids", set()).add(member.id)
+                    labels[member.id] = build_shuffle_member_label(
+                        member,
+                        hot_joiner=was_hot_joiner,
+                        returned=True,
+                    )
                     state["ever_seen"].add(member.id)
                     await update_shuffle_message(state)
             else:
                 # No timer: either they were removed earlier or they are a completely new member
                 if member.id not in state["order"]:
+                    if member.id not in state.get("ever_seen", set()) and not allow_hot_joiners:
+                        continue
+
                     state["order"].append(member.id)
                     labels = state.setdefault("labels", {})
 
                     # If they were in the list before -> this is a "return" -> 🌌
                     if member.id in state.get("ever_seen", set()):
-                        labels[member.id] = f"{member.display_name} 🌌"
+                        was_hot_joiner = is_shuffle_hot_joiner(state, member.id)
+                        if was_hot_joiner:
+                            state.setdefault("hot_joiner_member_ids", set()).add(member.id)
+                        labels[member.id] = build_shuffle_member_label(
+                            member,
+                            hot_joiner=was_hot_joiner,
+                            returned=True,
+                        )
                     else:
                         # Completely new member -> ✨
-                        labels[member.id] = f"{member.display_name} ✨"
+                        labels[member.id] = build_shuffle_member_label(member, hot_joiner=True)
+                        state.setdefault("hot_joiner_member_ids", set()).add(member.id)
                         state["ever_seen"].add(member.id)
 
                     await update_shuffle_message(state)
@@ -768,8 +2484,12 @@ async def create_scheduled_shuffle_event(
     # Human-friendly time output using Discord timestamp tags
     start_ts = int(start_time.timestamp())
     end_ts = int(end_time.timestamp())
-    linked_text_channel = pick_text_channel_for_voice(voice_channel)
-    shuffle_target = linked_text_channel or text_channel
+    shuffle_target = text_channel
+    remember_event_text_channel(
+        event.id,
+        shuffle_target.id,
+        start_time=start_time,
+    )
     shuffle_target_name = getattr(shuffle_target, "mention", "#unknown")
     await text_channel.send(
         f"📅 Scheduled event **{event.name}**\n"
@@ -798,16 +2518,678 @@ async def create_scheduled_shuffle_event(
     name='shuffle',
     description='Shuffle members in your voice channel'
 )
-async def shuffle_voice_members(ctx: commands.Context):
+@discord.app_commands.describe(
+    exclude="Mentions, IDs, or exact names to exclude from the shuffle"
+)
+async def shuffle_voice_members(
+    ctx: commands.Context,
+    *,
+    exclude: str = "",
+):
     await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
 
     if ctx.author.voice is None or ctx.author.voice.channel is None:
         await ctx.send("You need to be in a voice channel to use this command!")
         return
 
+    excluded_member_ids: set[int] = set()
+    if exclude.strip():
+        if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+            append_shuffle_audit_log(
+                action="shuffle_exclude_denied",
+                guild=guild,
+                actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+                channel_id=getattr(ctx.channel, "id", None),
+                details={"raw_exclude": exclude},
+            )
+            await ctx.send(
+                f"You do not have permission to exclude members from shuffles. "
+                f"Required role: {get_shuffle_exclusion_access_label()}.",
+            )
+            return
+
+        excluded_member_ids, unresolved = resolve_excluded_members(guild, exclude)
+        if unresolved:
+            await ctx.send(
+                "Could not resolve these users: "
+                + ", ".join(f"`{value}`" for value in unresolved[:10])
+            )
+            return
+
+        append_shuffle_audit_log(
+            action="shuffle_exclude_once",
+            guild=guild,
+            actor=ctx.author,
+            channel_id=getattr(ctx.channel, "id", None),
+            details={
+                "voice_channel_id": ctx.author.voice.channel.id,
+                "excluded_member_ids": sorted(excluded_member_ids),
+                "excluded_members": format_member_list(guild, excluded_member_ids),
+            },
+        )
+
     voice_channel = ctx.author.voice.channel
-    await start_shuffle_for_channel(ctx.guild, voice_channel, ctx.channel)
+    await start_shuffle_for_channel(
+        guild,
+        voice_channel,
+        ctx.channel,
+        excluded_member_ids=excluded_member_ids,
+    )
     await finish_hybrid_command(ctx, "Shuffle posted in this channel.")
+
+
+@bot.hybrid_command(
+    name='shuffle_exclude_add',
+    description='Persistently exclude users from future shuffles'
+)
+@discord.app_commands.describe(
+    users="Mentions, IDs, or exact names to exclude from future shuffles"
+)
+async def shuffle_exclude_add(
+    ctx: commands.Context,
+    *,
+    users: str,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_exclude_add_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+            details={"raw_users": users},
+        )
+        await ctx.send(
+            f"You do not have permission to manage persistent shuffle exclusions. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    member_ids, unresolved = resolve_excluded_members(guild, users)
+    if unresolved:
+        await ctx.send(
+            "Could not resolve these users: "
+            + ", ".join(f"`{value}`" for value in unresolved[:10])
+        )
+        return
+
+    if not member_ids:
+        await ctx.send("No valid users were provided.")
+        return
+
+    added_count = add_persistent_excluded_members(guild.id, member_ids)
+    member_list = format_member_list(guild, member_ids)
+    status = (
+        f"Added to persistent shuffle exclusions: {member_list}"
+        if added_count else
+        f"Already excluded: {member_list}"
+    )
+    append_shuffle_audit_log(
+        action="shuffle_exclude_add",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "member_ids": sorted(member_ids),
+            "members": member_list,
+            "added_count": added_count,
+        },
+    )
+    await refresh_active_shuffle_exclusions(guild.id)
+    await finish_hybrid_command(ctx, status)
+
+
+@bot.hybrid_command(
+    name='shuffle_exclude_remove',
+    description='Remove users from the persistent shuffle exclusion list'
+)
+@discord.app_commands.describe(
+    users="Mentions, IDs, or exact names to allow back into future shuffles"
+)
+async def shuffle_exclude_remove(
+    ctx: commands.Context,
+    *,
+    users: str,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_exclude_remove_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+            details={"raw_users": users},
+        )
+        await ctx.send(
+            f"You do not have permission to manage persistent shuffle exclusions. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    member_ids, unresolved = resolve_excluded_members(guild, users, allow_unknown_ids=True)
+    if unresolved:
+        await ctx.send(
+            "Could not resolve these users: "
+            + ", ".join(f"`{value}`" for value in unresolved[:10])
+        )
+        return
+
+    if not member_ids:
+        await ctx.send("No valid users were provided.")
+        return
+
+    removed_count = remove_persistent_excluded_members(guild.id, member_ids)
+    member_list = format_member_list(guild, member_ids)
+    status = (
+        f"Removed from persistent shuffle exclusions: {member_list}"
+        if removed_count else
+        f"These users were not persistently excluded: {member_list}"
+    )
+    append_shuffle_audit_log(
+        action="shuffle_exclude_remove",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "member_ids": sorted(member_ids),
+            "members": member_list,
+            "removed_count": removed_count,
+        },
+    )
+    await refresh_active_shuffle_exclusions(guild.id)
+    await finish_hybrid_command(ctx, status)
+
+
+@bot.hybrid_command(
+    name='shuffle_exclude_list',
+    description='List users persistently excluded from future shuffles'
+)
+async def shuffle_exclude_list(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_exclude_list_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to view persistent shuffle exclusions. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    member_ids = get_persistent_excluded_member_ids(guild.id)
+    append_shuffle_audit_log(
+        action="shuffle_exclude_list",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "member_ids": sorted(member_ids),
+            "members": format_member_list(guild, member_ids) if member_ids else "",
+        },
+    )
+    if not member_ids:
+        await finish_hybrid_command(ctx, "No persistent shuffle exclusions are set.")
+        return
+
+    await send_hybrid_response(
+        ctx,
+        "**Persistent shuffle exclusions**\n" + format_member_list(guild, member_ids),
+    )
+
+
+@bot.hybrid_command(
+    name='shuffle_hot_joiners_on',
+    description='Allow brand-new late joiners to be added to active shuffles'
+)
+async def shuffle_hot_joiners_on(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_hot_joiners_on_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage shuffle hot-joiner behavior. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    set_allow_hot_joiners(guild.id, True)
+    append_shuffle_audit_log(
+        action="shuffle_hot_joiners_on",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"allow_hot_joiners": True},
+    )
+    await refresh_active_shuffle_settings(guild.id)
+    await finish_hybrid_command(ctx, "Hot joiners are now enabled for future and active shuffles.")
+
+
+@bot.hybrid_command(
+    name='shuffle_hot_joiners_off',
+    description='Prevent brand-new late joiners from being added to active shuffles'
+)
+async def shuffle_hot_joiners_off(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_hot_joiners_off_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage shuffle hot-joiner behavior. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    set_allow_hot_joiners(guild.id, False)
+    append_shuffle_audit_log(
+        action="shuffle_hot_joiners_off",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"allow_hot_joiners": False},
+    )
+    await refresh_active_shuffle_settings(guild.id)
+    await finish_hybrid_command(ctx, "Hot joiners are now disabled. Reconnects still return to the shuffle.")
+
+
+@bot.hybrid_command(
+    name='shuffle_hot_joiners_status',
+    description='Show whether brand-new late joiners are added to active shuffles'
+)
+async def shuffle_hot_joiners_status(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_hot_joiners_status_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to view shuffle hot-joiner behavior. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    allow_hot_joiners = get_allow_hot_joiners(guild.id)
+    append_shuffle_audit_log(
+        action="shuffle_hot_joiners_status",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"allow_hot_joiners": allow_hot_joiners},
+    )
+    await finish_hybrid_command(
+        ctx,
+        "Hot joiners are currently "
+        + ("enabled." if allow_hot_joiners else "disabled. Reconnects are still allowed."),
+    )
+
+
+@bot.hybrid_command(
+    name='camera_check_on',
+    description='Disconnect users in your voice channel if their camera stays off'
+)
+async def camera_check_on(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="camera_check_on_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel to start camera check mode.")
+        return
+
+    voice_channel = ctx.author.voice.channel
+    if not is_trackable_voice_channel(voice_channel):
+        await ctx.send("Camera check mode can only be used in voice or stage channels.")
+        return
+    if not bot_can_move_members(guild, voice_channel):
+        await ctx.send("I need the `Move Members` permission in that voice channel to use camera check mode.")
+        return
+
+    _, created = start_camera_enforcement(
+        guild,
+        voice_channel,
+        ctx.channel,
+        source=CAMERA_SOURCE_MANUAL,
+    )
+    append_shuffle_audit_log(
+        action="camera_check_on",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "voice_channel_id": voice_channel.id,
+            "created": created,
+            "camera_grace_seconds": CAMERA_GRACE_SECONDS,
+        },
+    )
+    await finish_hybrid_command(
+        ctx,
+        f"Camera check is active in `{voice_channel.name}`. "
+        f"Camera-off members will be disconnected after {CAMERA_GRACE_SECONDS} seconds.",
+    )
+
+
+@bot.hybrid_command(
+    name='camera_check_off',
+    description='Stop standalone camera check mode in your voice channel'
+)
+async def camera_check_off(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="camera_check_off_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in the voice channel whose standalone camera check should stop.")
+        return
+
+    voice_channel = ctx.author.voice.channel
+    state = active_camera_enforcements.get((guild.id, voice_channel.id))
+    had_manual_source = bool(state and CAMERA_SOURCE_MANUAL in state.get("sources", set()))
+    fully_stopped = stop_camera_enforcement(
+        guild.id,
+        voice_channel.id,
+        source=CAMERA_SOURCE_MANUAL,
+    )
+    append_shuffle_audit_log(
+        action="camera_check_off",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "voice_channel_id": voice_channel.id,
+            "had_manual_source": had_manual_source,
+            "fully_stopped": fully_stopped,
+        },
+    )
+
+    if not had_manual_source:
+        await finish_hybrid_command(ctx, f"Standalone camera check was not active in `{voice_channel.name}`.")
+        return
+
+    if fully_stopped:
+        await finish_hybrid_command(ctx, f"Camera check stopped in `{voice_channel.name}`.")
+        return
+
+    await finish_hybrid_command(
+        ctx,
+        f"Standalone camera check stopped in `{voice_channel.name}`. "
+        "Shuffle camera check is still active there.",
+    )
+
+
+@bot.hybrid_command(
+    name='camera_check_status',
+    description='Show active camera check modes in this server'
+)
+async def camera_check_status(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="camera_check_status_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to view camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    lines = []
+    for (state_guild_id, voice_channel_id), state in sorted(active_camera_enforcements.items()):
+        if state_guild_id != guild.id:
+            continue
+        voice_channel = guild.get_channel(voice_channel_id)
+        channel_label = voice_channel.name if voice_channel else f"channel-{voice_channel_id}"
+        pending_count = len(state.get("pending_kicks", {}))
+        source_label = format_camera_enforcement_sources(state.get("sources", set()))
+        lines.append(
+            f"`{channel_label}`: sources `{source_label}`, "
+            f"{pending_count} pending kick(s)"
+        )
+
+    append_shuffle_audit_log(
+        action="camera_check_status",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"active_channel_count": len(lines)},
+    )
+
+    if not lines:
+        await finish_hybrid_command(ctx, "No active camera checks in this server.")
+        return
+
+    await send_hybrid_response(
+        ctx,
+        "**Active camera checks**\n"
+        + f"Grace period: {CAMERA_GRACE_SECONDS} seconds\n"
+        + "\n".join(lines),
+    )
+
+
+@bot.hybrid_command(
+    name='shuffle_camera_on',
+    description='Require cameras during future and active shuffles'
+)
+async def shuffle_camera_on(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_camera_on_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage shuffle camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    set_require_camera_for_shuffles(guild.id, True)
+    append_shuffle_audit_log(
+        action="shuffle_camera_on",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"require_camera": True, "camera_grace_seconds": CAMERA_GRACE_SECONDS},
+    )
+    await refresh_active_shuffle_camera_enforcement(guild.id)
+    await finish_hybrid_command(
+        ctx,
+        f"Shuffle camera check is now enabled. "
+        f"Camera-off members will be disconnected after {CAMERA_GRACE_SECONDS} seconds.",
+    )
+
+
+@bot.hybrid_command(
+    name='shuffle_camera_off',
+    description='Stop requiring cameras during future and active shuffles'
+)
+async def shuffle_camera_off(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_camera_off_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to manage shuffle camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    set_require_camera_for_shuffles(guild.id, False)
+    append_shuffle_audit_log(
+        action="shuffle_camera_off",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={"require_camera": False},
+    )
+    await refresh_active_shuffle_camera_enforcement(guild.id)
+    await finish_hybrid_command(ctx, "Shuffle camera check is now disabled.")
+
+
+@bot.hybrid_command(
+    name='shuffle_camera_status',
+    description='Show whether shuffles require cameras'
+)
+async def shuffle_camera_status(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        append_shuffle_audit_log(
+            action="shuffle_camera_status_denied",
+            guild=guild,
+            actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+            channel_id=getattr(ctx.channel, "id", None),
+        )
+        await ctx.send(
+            f"You do not have permission to view shuffle camera checks. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    require_camera = get_require_camera_for_shuffles(guild.id)
+    active_shuffle_camera_channels = 0
+    for state in active_camera_enforcements.values():
+        if state["guild_id"] != guild.id:
+            continue
+        if any(
+            source.startswith(CAMERA_SOURCE_SHUFFLE_PREFIX)
+            for source in state.get("sources", set())
+        ):
+            active_shuffle_camera_channels += 1
+
+    append_shuffle_audit_log(
+        action="shuffle_camera_status",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "require_camera": require_camera,
+            "active_shuffle_camera_channels": active_shuffle_camera_channels,
+        },
+    )
+    await finish_hybrid_command(
+        ctx,
+        "Shuffle camera check is currently "
+        + ("enabled" if require_camera else "disabled")
+        + f". Active shuffle camera channel(s): {active_shuffle_camera_channels}.",
+    )
 
 
 # ===============================
@@ -1020,8 +3402,12 @@ async def attach_event(ctx: commands.Context, event_id: str):
     if end_time is None:
         end_time = start_time + timedelta(hours=2)
 
-    linked_text_channel = pick_text_channel_for_voice(voice_channel)
-    shuffle_target = linked_text_channel or ctx.channel
+    shuffle_target = ctx.channel
+    remember_event_text_channel(
+        event.id,
+        shuffle_target.id,
+        start_time=start_time,
+    )
 
     await ctx.send(
         f"Attached to event **{event.name}** (`{event.id}`).\n"
@@ -1089,23 +3475,212 @@ async def list_events(ctx: commands.Context):
 
 
 # ===============================
+#   COMMANDS: voice activity
+# ===============================
+
+@bot.hybrid_command(
+    name='voice_stats',
+    description='Show saved voice totals for a server member'
+)
+async def voice_stats(
+    ctx: commands.Context,
+    member: Optional[discord.Member] = None,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await send_hybrid_response(ctx, "This command can only be used inside a server.", ephemeral=True)
+        return
+
+    target = member or ctx.author
+    if not isinstance(target, discord.Member):
+        await send_hybrid_response(ctx, "Could not resolve the target member.", ephemeral=True)
+        return
+
+    today_label, today_start, _ = get_report_period_bounds("today")
+    week_label, week_start, _ = get_report_period_bounds("week")
+    _, all_start, all_end = get_report_period_bounds("all")
+
+    today_summary = summarize_voice_usage(
+        guild.id,
+        target.id,
+        range_start=today_start,
+    )
+    week_summary = summarize_voice_usage(
+        guild.id,
+        target.id,
+        range_start=week_start,
+    )
+    all_time_summary = summarize_voice_usage(
+        guild.id,
+        target.id,
+        range_start=all_start,
+        range_end=all_end,
+    )
+
+    lines = [
+        f"**Voice stats for {target.display_name}**",
+        f"Timezone: `{format_timezone_label()}`",
+        (
+            f"{today_label.title()}: {format_duration(today_summary['total_seconds'])} "
+            f"across {format_session_count(today_summary['session_count'])}"
+        ),
+        (
+            f"{week_label.title()}: {format_duration(week_summary['total_seconds'])} "
+            f"across {format_session_count(week_summary['session_count'])}"
+        ),
+        (
+            f"All time: {format_duration(all_time_summary['total_seconds'])} "
+            f"across {format_session_count(all_time_summary['session_count'])}"
+        ),
+    ]
+
+    active_session = all_time_summary["active_session"]
+    if active_session is not None:
+        channel_label = resolve_voice_channel_label(
+            guild,
+            active_session["channel_id"],
+            active_session["channel_name"],
+        )
+        started_ts = int(active_session["started_at"].timestamp())
+        lines.append(
+            f"Active now: `{channel_label}` since <t:{started_ts}:F> "
+            f"({format_duration(active_session['duration_seconds'])})"
+        )
+
+    await send_hybrid_response(ctx, "\n".join(lines))
+
+
+@bot.hybrid_command(
+    name='voice_sessions',
+    description='Show recent tracked voice sessions for a server member'
+)
+async def voice_sessions(
+    ctx: commands.Context,
+    member: Optional[discord.Member] = None,
+    limit: int = 10,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await send_hybrid_response(ctx, "This command can only be used inside a server.", ephemeral=True)
+        return
+
+    target = member or ctx.author
+    if not isinstance(target, discord.Member):
+        await send_hybrid_response(ctx, "Could not resolve the target member.", ephemeral=True)
+        return
+
+    limit = normalize_report_limit(limit, default=10, minimum=1, maximum=20)
+    now = utc_now()
+    sessions = [
+        build_session_record_from_row(row, active=True, now=now)
+        for row in load_active_voice_sessions(guild.id, user_id=target.id)
+    ]
+    sessions.extend(
+        build_session_record_from_row(row, active=False, now=now)
+        for row in load_completed_voice_sessions(
+            guild.id,
+            user_id=target.id,
+            limit=limit,
+        )
+    )
+    sessions.sort(key=lambda session: session["started_at"], reverse=True)
+    sessions = sessions[:limit]
+
+    if not sessions:
+        await send_hybrid_response(ctx, f"No tracked voice sessions found for **{target.display_name}**.")
+        return
+
+    lines = [
+        f"**Recent voice sessions for {target.display_name}**",
+        f"Timezone: `{format_timezone_label()}`",
+    ]
+
+    for index, session in enumerate(sessions, start=1):
+        channel_label = resolve_voice_channel_label(
+            guild,
+            session["channel_id"],
+            session["channel_name"],
+        )
+        started_ts = int(session["started_at"].timestamp())
+        if session["active"]:
+            lines.append(
+                f"{index}. `{channel_label}` | start <t:{started_ts}:F> | "
+                f"ongoing | elapsed {format_duration(session['duration_seconds'])}"
+            )
+            continue
+
+        ended_ts = int(session["ended_at"].timestamp())
+        lines.append(
+            f"{index}. `{channel_label}` | <t:{started_ts}:F> -> <t:{ended_ts}:F> | "
+            f"{format_duration(session['duration_seconds'])}"
+        )
+
+    await send_hybrid_response(ctx, "\n".join(lines))
+
+
+@bot.hybrid_command(
+    name='voice_daily',
+    description='Show per-day voice totals for a server member'
+)
+async def voice_daily(
+    ctx: commands.Context,
+    member: Optional[discord.Member] = None,
+    days: int = 7,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await send_hybrid_response(ctx, "This command can only be used inside a server.", ephemeral=True)
+        return
+
+    target = member or ctx.author
+    if not isinstance(target, discord.Member):
+        await send_hybrid_response(ctx, "Could not resolve the target member.", ephemeral=True)
+        return
+
+    days = normalize_report_limit(days, default=7, minimum=1, maximum=31)
+    breakdown = build_daily_voice_breakdown(guild.id, target.id, days=days)
+
+    lines = [
+        f"**Daily voice totals for {target.display_name}**",
+        f"Timezone: `{format_timezone_label()}`",
+    ]
+    for day_label, total_seconds in breakdown:
+        lines.append(f"`{day_label}`: {format_duration(total_seconds)}")
+
+    await send_hybrid_response(ctx, "\n".join(lines))
+
+
+# ===============================
 #   Misc commands
 # ===============================
 
 @bot.hybrid_command(name='ping', description='Test if the bot is responsive')
 async def ping(ctx: commands.Context):
-    await ctx.send('Pong!')
+    await send_hybrid_response(ctx, 'Pong!')
 
 
 @bot.command(name='sync')
 async def sync_commands(ctx: commands.Context):
-    """Sync application commands only to this guild."""
+    """Copy global app commands into this guild and sync them immediately."""
     if ctx.guild is None:
         await ctx.send("This command can only be used inside a server.")
         return
     try:
+        if USE_GUILD_ONLY_APP_COMMANDS:
+            cleared_count = await clear_remote_global_commands_preserving_local_tree()
+            print(f"Cleared global app commands before guild sync. Remaining global count: {cleared_count}")
+        bot.tree.clear_commands(guild=ctx.guild)
+        bot.tree.copy_global_to(guild=ctx.guild)
         synced = await bot.tree.sync(guild=ctx.guild)
-        await ctx.send(f"Synced {len(synced)} command(s) to this server.")
+        await ctx.send(
+            f"Copied global commands and synced {len(synced)} command(s) to this server."
+        )
     except Exception as e:
         await ctx.send(f"Failed to sync commands: {e}")
 
