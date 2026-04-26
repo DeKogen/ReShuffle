@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import re
 import traceback
+from functools import lru_cache
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -27,6 +28,8 @@ USE_GUILD_ONLY_APP_COMMANDS = True
 
 # text_channel_id -> shuffle state
 active_shuffles: dict[int, dict] = {}
+# guild_id -> timed SDG shuffle state
+active_sdg_shuffles: dict[int, dict] = {}
 # (guild_id, voice_channel_id) -> camera enforcement state
 active_camera_enforcements: dict[tuple[int, int], dict] = {}
 triggered_event_occurrences: set[tuple[int, int]] = set()
@@ -43,12 +46,46 @@ LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 REMOVE_DELAY = 30  # seconds after leaving the voice channel
 CAMERA_GRACE_SECONDS = 30  # seconds to allow camera-off state before disconnecting
 SHUFFLE_TRACKING_WINDOW = 600  # seconds to keep accepting join/leave updates
+SDG_ROUND_SECONDS = 300  # 5 minutes
 STARTUP_CLOCK_SKEW = timedelta(seconds=5)
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
 FROZEN_EVENT_MARKER = "[замороженно]"
 CAMERA_SOURCE_MANUAL = "manual"
 CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
+
+SDG_GROUP_TEMPLATES = [
+    {"counts": {"u": 1, "c": 1}, "score": (0, 0, 0), "label": "uc_pair"},
+    {"counts": {"m": 1, "c": 1}, "score": (0, 0, 0), "label": "mc_pair"},
+    {"counts": {"u": 1, "c": 1, "r": 1}, "score": (0, 0, 1), "label": "ucr_trio"},
+    {"counts": {"m": 1, "c": 1, "r": 1}, "score": (0, 0, 1), "label": "mcr_trio"},
+    {"counts": {"u": 1, "c": 2}, "score": (0, 0, 1), "label": "ucc_trio"},
+    {"counts": {"m": 1, "c": 2}, "score": (0, 0, 1), "label": "mcc_trio"},
+    {"counts": {"u": 2, "c": 1}, "score": (0, 1, 1), "label": "uuc_trio"},
+    {"counts": {"u": 1, "m": 1, "c": 1}, "score": (0, 1, 1), "label": "umc_trio"},
+    {"counts": {"m": 2, "c": 1}, "score": (0, 1, 1), "label": "mmc_trio"},
+    {"counts": {"u": 1, "r": 1}, "score": (1, 0, 0), "label": "ur_pair"},
+    {"counts": {"m": 1, "r": 1}, "score": (0, 0, 0), "label": "mr_pair"},
+    {"counts": {"u": 1, "r": 2}, "score": (1, 0, 1), "label": "urr_trio"},
+    {"counts": {"m": 1, "r": 2}, "score": (0, 0, 1), "label": "mrr_trio"},
+    {"counts": {"u": 2, "r": 1}, "score": (2, 1, 1), "label": "uur_trio"},
+    {"counts": {"u": 1, "m": 1, "r": 1}, "score": (1, 1, 1), "label": "umr_trio"},
+    {"counts": {"m": 2, "r": 1}, "score": (0, 1, 1), "label": "mmr_trio"},
+    {"counts": {"u": 2}, "score": (2, 1, 0), "label": "uu_pair"},
+    {"counts": {"u": 1, "m": 1}, "score": (1, 1, 0), "label": "um_pair"},
+    {"counts": {"m": 2}, "score": (0, 1, 0), "label": "mm_pair"},
+    {"counts": {"u": 3}, "score": (3, 3, 1), "label": "uuu_trio"},
+    {"counts": {"u": 2, "m": 1}, "score": (2, 3, 1), "label": "uum_trio"},
+    {"counts": {"u": 1, "m": 2}, "score": (1, 3, 1), "label": "umm_trio"},
+    {"counts": {"m": 3}, "score": (0, 3, 1), "label": "mmm_trio"},
+    {"counts": {"c": 2}, "score": (0, 0, 0), "label": "cc_pair"},
+    {"counts": {"c": 1, "r": 1}, "score": (0, 0, 0), "label": "cr_pair"},
+    {"counts": {"r": 2}, "score": (0, 0, 0), "label": "rr_pair"},
+    {"counts": {"c": 3}, "score": (0, 0, 1), "label": "ccc_trio"},
+    {"counts": {"c": 2, "r": 1}, "score": (0, 0, 1), "label": "ccr_trio"},
+    {"counts": {"c": 1, "r": 2}, "score": (0, 0, 1), "label": "crr_trio"},
+    {"counts": {"r": 3}, "score": (0, 0, 1), "label": "rrr_trio"},
+]
 
 
 def resolve_data_dir() -> str:
@@ -737,6 +774,27 @@ def has_shuffle_exclusion_access(member: discord.Member) -> bool:
 def get_shuffle_exclusion_access_label() -> str:
     """Return a readable role requirement label for user-facing errors."""
     return f"`{RELIABLE_ROLE_NAME}` or `{TRUSTED_ROLE_NAME}`"
+
+
+SDG_NEWCOMER_ROLE_NAME = "нашедшийся"
+_sdg_newcomer_role_id_env = os.getenv("SDG_NEWCOMER_ROLE_ID")
+SDG_NEWCOMER_ROLE_ID = int(_sdg_newcomer_role_id_env) if _sdg_newcomer_role_id_env else None
+SDG_CORE_ROLE_NAME = "core"
+_sdg_core_role_id_env = os.getenv("SDG_CORE_ROLE_ID")
+SDG_CORE_ROLE_ID = int(_sdg_core_role_id_env) if _sdg_core_role_id_env else None
+
+
+def member_has_configured_role(
+    member: discord.Member,
+    *,
+    role_id: Optional[int],
+    role_name: str,
+) -> bool:
+    """Check for a role by configured ID first, then by case-insensitive name."""
+    if role_id is not None:
+        return any(role.id == role_id for role in member.roles)
+    required_name = role_name.casefold()
+    return any(role.name.casefold() == required_name for role in member.roles)
 
 
 def resolve_excluded_members(
@@ -2269,6 +2327,650 @@ async def cleanup_old_shuffle(channel_id: int, delay_sec: int) -> None:
         )
 
 
+def sdg_is_core_member(member: discord.Member) -> bool:
+    """Treat the Discord role `core` as the SDG priority-partner marker."""
+    return member_has_configured_role(
+        member,
+        role_id=SDG_CORE_ROLE_ID,
+        role_name=SDG_CORE_ROLE_NAME,
+    )
+
+
+def sdg_is_newcomer_member(member: discord.Member) -> bool:
+    """Treat the Discord role `нашедшийся` as the SDG newcomer marker."""
+    if sdg_is_core_member(member):
+        return False
+    return member_has_configured_role(
+        member,
+        role_id=SDG_NEWCOMER_ROLE_ID,
+        role_name=SDG_NEWCOMER_ROLE_NAME,
+    )
+
+
+def sdg_visible_name(name: str) -> str:
+    """Strip legacy star suffixes for stable sorting if old nicknames still remain."""
+    if name.endswith("**"):
+        return name[:-2]
+    if name.endswith("*"):
+        return name[:-1]
+    return name
+
+
+def sdg_sort_member_ids(member_ids: list[int], display_names_by_id: dict[int, str]) -> list[int]:
+    """Sort member IDs by their display names without SDG marker suffixes."""
+    return sorted(
+        member_ids,
+        key=lambda member_id: sdg_visible_name(
+            display_names_by_id.get(member_id, f"user-{member_id}")
+        ).lower(),
+    )
+
+
+def sdg_can_apply_template(counts: dict[str, int], template: dict) -> bool:
+    """Check whether one template can be applied to the remaining participant buckets."""
+    return all(counts[key] >= needed for key, needed in template["counts"].items())
+
+
+def sdg_subtract_counts(counts: dict[str, int], template: dict) -> tuple[int, int, int, int]:
+    """Subtract a template from the unmet/met/core/regular counts."""
+    next_counts = dict(counts)
+    for key, needed in template["counts"].items():
+        next_counts[key] -= needed
+    return (
+        next_counts["u"],
+        next_counts["m"],
+        next_counts["c"],
+        next_counts["r"],
+    )
+
+
+@lru_cache(maxsize=None)
+def sdg_find_group_plan(
+    unmet_newcomers_count: int,
+    met_newcomers_count: int,
+    priority_count: int,
+    regulars_count: int,
+):
+    """Find the best group template sequence for one round."""
+    counts = {
+        "u": unmet_newcomers_count,
+        "m": met_newcomers_count,
+        "c": priority_count,
+        "r": regulars_count,
+    }
+
+    if all(value == 0 for value in counts.values()):
+        return (0, 0, 0), []
+
+    best_score = None
+    best_plans = []
+
+    for template in SDG_GROUP_TEMPLATES:
+        if not sdg_can_apply_template(counts, template):
+            continue
+
+        next_state = sdg_subtract_counts(counts, template)
+        child = sdg_find_group_plan(*next_state)
+        if child is None:
+            continue
+
+        child_score, child_plan = child
+        current_score = tuple(
+            template["score"][index] + child_score[index]
+            for index in range(3)
+        )
+        current_plan = [template["label"]] + child_plan
+
+        if best_score is None or current_score < best_score:
+            best_score = current_score
+            best_plans = [current_plan]
+        elif current_score == best_score:
+            best_plans.append(current_plan)
+
+    if best_score is None:
+        return None
+
+    return best_score, best_plans[0]
+
+
+def sdg_make_groups(
+    member_ids: list[int],
+    display_names_by_id: dict[int, str],
+    newcomers_with_core: set[int],
+    newcomer_member_ids: set[int],
+    core_member_ids: set[int],
+) -> tuple[list[list[int]], set[int]]:
+    """Build SDG pairs/trios for the active members of one round."""
+    unmet_newcomers = [
+        member_id
+        for member_id in member_ids
+        if member_id in newcomer_member_ids
+        and member_id not in newcomers_with_core
+    ]
+    met_newcomers = [
+        member_id
+        for member_id in member_ids
+        if member_id in newcomer_member_ids
+        and member_id in newcomers_with_core
+    ]
+    priority_regulars = [
+        member_id
+        for member_id in member_ids
+        if member_id in core_member_ids
+    ]
+    regulars = [
+        member_id
+        for member_id in member_ids
+        if member_id not in newcomer_member_ids
+        and member_id not in core_member_ids
+    ]
+
+    random.shuffle(unmet_newcomers)
+    random.shuffle(met_newcomers)
+    random.shuffle(priority_regulars)
+    random.shuffle(regulars)
+
+    plan_result = sdg_find_group_plan(
+        len(unmet_newcomers),
+        len(met_newcomers),
+        len(priority_regulars),
+        len(regulars),
+    )
+    if plan_result is None:
+        raise ValueError("Could not build groups for the current participant set.")
+
+    _, plan = plan_result
+    templates_by_label = {
+        template["label"]: template for template in SDG_GROUP_TEMPLATES
+    }
+    pools = {
+        "u": unmet_newcomers,
+        "m": met_newcomers,
+        "c": priority_regulars,
+        "r": regulars,
+    }
+    groups: list[list[int]] = []
+    met_core_this_round: set[int] = set()
+
+    def pop_from_pool(pool_key: str) -> int:
+        pool = pools[pool_key]
+        if not pool:
+            raise ValueError("The SDG plan could not be fulfilled for this round.")
+        return pool.pop()
+
+    for label in plan:
+        template = templates_by_label[label]
+        group: list[int] = []
+        has_core = "c" in template["counts"]
+
+        for pool_key, amount in template["counts"].items():
+            for _ in range(amount):
+                member_id = pop_from_pool(pool_key)
+                group.append(member_id)
+                if pool_key == "u" and has_core:
+                    met_core_this_round.add(member_id)
+
+        random.shuffle(group)
+        groups.append(group)
+
+    random.shuffle(groups)
+    return groups, met_core_this_round
+
+
+def sdg_assign_voices(groups: list[list[int]], reserved_voices: set[int]) -> list[dict]:
+    """Assign logical voice numbers, skipping rooms held by 10-minute groups."""
+    assigned_groups = []
+    next_voice = 1
+
+    for group in groups:
+        while next_voice in reserved_voices:
+            next_voice += 1
+
+        assigned_groups.append({"member_ids": group, "voice": next_voice})
+        next_voice += 1
+
+    return assigned_groups
+
+
+def sdg_get_next_round_paused(
+    assigned_groups: list[dict],
+    newcomer_member_ids: set[int],
+) -> tuple[set[int], set[int]]:
+    """Pause groups with newcomer-role members for one extra 5-minute slot."""
+    paused_member_ids: set[int] = set()
+    paused_voices: set[int] = set()
+
+    for group in assigned_groups:
+        if any(
+            member_id in newcomer_member_ids
+            for member_id in group["member_ids"]
+        ):
+            paused_member_ids.update(group["member_ids"])
+            paused_voices.add(group["voice"])
+
+    return paused_member_ids, paused_voices
+
+
+def get_sdg_shuffle_access_label() -> str:
+    """Human-friendly permission label for timed room shuffles."""
+    return f"{get_shuffle_exclusion_access_label()} or `Move Members` permission"
+
+
+def has_sdg_shuffle_access(member: discord.Member) -> bool:
+    """Allow timed room shuffles for trusted roles or members who can move others."""
+    return has_shuffle_exclusion_access(member) or member.guild_permissions.move_members
+
+
+def sdg_extract_trailing_number(value: str) -> Optional[int]:
+    """Extract the last numeric suffix from a channel name, if present."""
+    match = re.search(r"(\d+)(?!.*\d)", value)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def sdg_voice_channel_sort_key(channel: discord.VoiceChannel) -> tuple[int, int, int, int]:
+    """Prefer numbered breakout rooms, then fall back to channel position."""
+    trailing_number = sdg_extract_trailing_number(channel.name)
+    if trailing_number is None:
+        return (1, 0, channel.position, channel.id)
+    return (0, trailing_number, channel.position, channel.id)
+
+
+def get_sdg_target_voice_channels(
+    guild: discord.Guild,
+    anchor_channel: discord.VoiceChannel,
+) -> list[discord.VoiceChannel]:
+    """Use voice channels from the same category as breakout rooms for SDG shuffle."""
+    if anchor_channel.category is None:
+        channels = [anchor_channel]
+    else:
+        channels = [
+            channel
+            for channel in anchor_channel.category.voice_channels
+            if channel.id != getattr(guild.afk_channel, "id", None)
+        ]
+        if anchor_channel.id not in {channel.id for channel in channels}:
+            channels.append(anchor_channel)
+
+    return sorted(channels, key=sdg_voice_channel_sort_key)
+
+
+def resolve_sdg_voice_channel(
+    session: dict,
+    guild: discord.Guild,
+    voice_number: int,
+) -> Optional[discord.VoiceChannel]:
+    """Map SDG logical room numbers to real Discord voice channels."""
+    index = voice_number - 1
+    channel_ids = session.get("target_voice_channel_ids", [])
+    if index < 0 or index >= len(channel_ids):
+        return None
+
+    channel = guild.get_channel(channel_ids[index])
+    if isinstance(channel, discord.VoiceChannel):
+        return channel
+    return None
+
+
+def collect_sdg_present_members(
+    session: dict,
+    guild: discord.Guild,
+) -> dict[int, discord.Member]:
+    """Collect tracked participants who are currently inside the managed rooms."""
+    tracked_channel_ids = set(session.get("target_voice_channel_ids", []))
+    tracked_channel_ids.add(session.get("anchor_voice_channel_id"))
+    present_members: dict[int, discord.Member] = {}
+
+    for member_id in session["participant_ids"]:
+        member = guild.get_member(member_id)
+        if member is None or member.bot:
+            continue
+        member_voice = member.voice
+        if member_voice is None or member_voice.channel is None:
+            continue
+        if member_voice.channel.id not in tracked_channel_ids:
+            continue
+        present_members[member_id] = member
+
+    return present_members
+
+
+def build_sdg_next_round(session: dict, present_members: dict[int, discord.Member]) -> dict:
+    """Advance the SDG state machine by one 5-minute round."""
+    display_names_by_id = {
+        member_id: member.display_name
+        for member_id, member in present_members.items()
+    }
+    newcomer_member_ids = {
+        member_id
+        for member_id, member in present_members.items()
+        if sdg_is_newcomer_member(member)
+    }
+    core_member_ids = {
+        member_id
+        for member_id, member in present_members.items()
+        if sdg_is_core_member(member)
+    }
+    present_member_ids = list(present_members.keys())
+    paused_now_ids = {
+        member_id
+        for member_id in session["paused_member_ids"]
+        if member_id in present_members
+    }
+
+    holding_groups = []
+    last_round = session.get("last_round")
+    if last_round:
+        for group in last_round.get("groups", []):
+            group_member_ids = [
+                member_id
+                for member_id in group["member_ids"]
+                if member_id in paused_now_ids
+            ]
+            if group_member_ids:
+                holding_groups.append(
+                    {
+                        "member_ids": group_member_ids,
+                        "voice": group["voice"],
+                    }
+                )
+
+    active_member_ids = [
+        member_id
+        for member_id in present_member_ids
+        if member_id not in paused_now_ids
+    ]
+
+    if len(active_member_ids) >= 2:
+        raw_groups, met_core_this_round = sdg_make_groups(
+            active_member_ids,
+            display_names_by_id,
+            session["newcomers_with_core"],
+            newcomer_member_ids,
+            core_member_ids,
+        )
+    else:
+        raw_groups = []
+        met_core_this_round = set()
+
+    groups = sdg_assign_voices(raw_groups, session["reserved_voice_numbers"])
+    paused_next, reserved_voices_next = sdg_get_next_round_paused(
+        groups,
+        newcomer_member_ids,
+    )
+
+    round_info = {
+        "round_number": session["round_number"],
+        "groups": groups,
+        "holding_groups": holding_groups,
+        "paused_now_ids": sdg_sort_member_ids(
+            list(paused_now_ids),
+            display_names_by_id,
+        ),
+        "display_names_by_id": display_names_by_id,
+        "present_member_ids": set(present_member_ids),
+    }
+
+    session["newcomers_with_core"].update(met_core_this_round)
+    session["paused_member_ids"] = paused_next
+    session["reserved_voice_numbers"] = reserved_voices_next
+    session["round_number"] += 1
+    session["last_round"] = {"groups": groups}
+
+    return round_info
+
+
+def format_sdg_group_members(member_ids: list[int], display_names_by_id: dict[int, str]) -> str:
+    """Render one SDG group as a stable display-name list."""
+    return " — ".join(
+        display_names_by_id.get(member_id, f"user-{member_id}")
+        for member_id in member_ids
+    )
+
+
+def build_sdg_group_line(
+    session: dict,
+    guild: discord.Guild,
+    group: dict,
+    display_names_by_id: dict[int, str],
+) -> str:
+    """Render one room assignment line for the SDG status message."""
+    target_channel = resolve_sdg_voice_channel(session, guild, group["voice"])
+    channel_label = target_channel.mention if target_channel is not None else f"`voice{group['voice']}`"
+    people = format_sdg_group_members(group["member_ids"], display_names_by_id)
+    return f"`voice{group['voice']}` -> {channel_label}: {people}"
+
+
+def build_sdg_shuffle_content(
+    session: dict,
+    guild: discord.Guild,
+    round_info: Optional[dict] = None,
+    *,
+    move_errors: Optional[list[str]] = None,
+    stopped_reason: Optional[str] = None,
+) -> str:
+    """Build the live status message for the timed SDG shuffle."""
+    lines = ["🎯 **SDG timed shuffle**"]
+    tracked_count = len(session.get("participant_ids", set()))
+
+    if stopped_reason is not None:
+        lines.append(stopped_reason)
+        lines.append(f"Tracked participants: {tracked_count}")
+        return "\n".join(lines)
+
+    if round_info is None:
+        lines.append("Preparing the first round...")
+        lines.append(f"Tracked participants: {tracked_count}")
+        return "\n".join(lines)
+
+    present_count = len(round_info["present_member_ids"])
+    lines.append(f"Round: `{round_info['round_number']}`")
+    lines.append(f"Tracked participants in managed rooms: `{present_count}/{tracked_count}`")
+
+    next_round_at = session.get("next_round_at")
+    if next_round_at is not None:
+        lines.append(f"Next reshuffle: <t:{int(next_round_at.timestamp())}:R>")
+
+    if round_info["holding_groups"]:
+        lines.append(
+            f"Holding for the second 5-minute slot "
+            f"(groups with role `{SDG_NEWCOMER_ROLE_NAME}`):"
+        )
+        for group in round_info["holding_groups"]:
+            lines.append(
+                build_sdg_group_line(
+                    session,
+                    guild,
+                    group,
+                    round_info["display_names_by_id"],
+                )
+            )
+
+    if round_info["groups"]:
+        lines.append("New moves this round:")
+        for group in round_info["groups"]:
+            lines.append(
+                build_sdg_group_line(
+                    session,
+                    guild,
+                    group,
+                    round_info["display_names_by_id"],
+                )
+            )
+    elif not round_info["holding_groups"]:
+        lines.append("No new groups this round.")
+
+    if round_info["paused_now_ids"]:
+        paused_names = ", ".join(
+            round_info["display_names_by_id"].get(member_id, f"user-{member_id}")
+            for member_id in round_info["paused_now_ids"]
+        )
+        lines.append(f"Skipping reshuffle this slot: {paused_names}")
+
+    if move_errors:
+        lines.append("Move issues:")
+        lines.extend(f"- {error}" for error in move_errors[:10])
+
+    return "\n".join(lines)
+
+
+async def edit_sdg_shuffle_message(session: dict, content: str) -> None:
+    """Best-effort message edit for the live SDG session status."""
+    message = session.get("message")
+    if message is None:
+        return
+
+    try:
+        await message.edit(content=content)
+    except discord.NotFound:
+        pass
+    except Exception as e:
+        print(f"Failed to edit SDG shuffle message: {e}")
+
+
+async def stop_sdg_shuffle_session(
+    guild_id: int,
+    reason: str,
+    *,
+    cancel_task: bool = True,
+) -> bool:
+    """Stop one active timed SDG shuffle session and freeze its status message."""
+    session = active_sdg_shuffles.pop(guild_id, None)
+    if session is None:
+        return False
+
+    session["next_round_at"] = None
+    task = session.get("task")
+    if (
+        cancel_task
+        and task is not None
+        and task is not asyncio.current_task()
+    ):
+        task.cancel()
+
+    guild = bot.get_guild(guild_id)
+    if guild is not None:
+        await edit_sdg_shuffle_message(
+            session,
+            build_sdg_shuffle_content(
+                session,
+                guild,
+                stopped_reason=reason,
+            ),
+        )
+
+    return True
+
+
+async def move_sdg_groups_for_round(
+    session: dict,
+    guild: discord.Guild,
+    round_info: dict,
+) -> list[str]:
+    """Move each newly assigned group into its target voice room."""
+    move_errors: list[str] = []
+
+    for group in round_info["groups"]:
+        target_channel = resolve_sdg_voice_channel(session, guild, group["voice"])
+        if target_channel is None:
+            move_errors.append(
+                f"`voice{group['voice']}` has no matching Discord voice channel."
+            )
+            continue
+
+        if target_channel.user_limit and len(group["member_ids"]) > target_channel.user_limit:
+            move_errors.append(
+                f"`{target_channel.name}` only allows {target_channel.user_limit} members, "
+                f"but this group has {len(group['member_ids'])}."
+            )
+            continue
+
+        for member_id in group["member_ids"]:
+            member = guild.get_member(member_id)
+            if member is None or member.bot:
+                continue
+
+            member_voice = member.voice
+            if member_voice is None or member_voice.channel is None:
+                continue
+            if member_voice.channel.id == target_channel.id:
+                continue
+
+            try:
+                await member.move_to(
+                    target_channel,
+                    reason=f"SDG shuffle round {round_info['round_number']}",
+                )
+            except discord.Forbidden:
+                move_errors.append(
+                    f"Could not move **{member.display_name}** to `{target_channel.name}`. "
+                    "Check `Move Members` and channel access."
+                )
+            except discord.HTTPException as error:
+                move_errors.append(
+                    f"Discord rejected moving **{member.display_name}** to `{target_channel.name}`: {error}"
+                )
+
+    return move_errors
+
+
+async def run_sdg_shuffle_session(guild_id: int) -> None:
+    """Drive the repeating 5-minute SDG reshuffle loop for one guild."""
+    try:
+        while True:
+            session = active_sdg_shuffles.get(guild_id)
+            if session is None:
+                return
+
+            guild = bot.get_guild(guild_id)
+            if guild is None:
+                await stop_sdg_shuffle_session(
+                    guild_id,
+                    "Stopped because the bot is no longer connected to the server.",
+                    cancel_task=False,
+                )
+                return
+
+            present_members = collect_sdg_present_members(session, guild)
+            round_info = build_sdg_next_round(session, present_members)
+            move_errors = await move_sdg_groups_for_round(session, guild, round_info)
+            session["next_round_at"] = utc_now() + timedelta(seconds=SDG_ROUND_SECONDS)
+
+            await edit_sdg_shuffle_message(
+                session,
+                build_sdg_shuffle_content(
+                    session,
+                    guild,
+                    round_info,
+                    move_errors=move_errors,
+                ),
+            )
+
+            if (
+                len(round_info["present_member_ids"]) < 2
+                and not round_info["groups"]
+                and not round_info["holding_groups"]
+            ):
+                await stop_sdg_shuffle_session(
+                    guild_id,
+                    "Stopped because fewer than 2 tracked participants remain in the managed rooms.",
+                    cancel_task=False,
+                )
+                return
+
+            await asyncio.sleep(SDG_ROUND_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        traceback.print_exc()
+        await stop_sdg_shuffle_session(
+            guild_id,
+            f"Stopped after an error: `{error}`",
+            cancel_task=False,
+        )
+
+
 async def defer_hybrid_command(ctx: commands.Context) -> None:
     """Acknowledge slash invocations that send their real output directly to the channel."""
     if ctx.interaction is None or ctx.interaction.response.is_done():
@@ -2581,6 +3283,137 @@ async def shuffle_voice_members(
         excluded_member_ids=excluded_member_ids,
     )
     await finish_hybrid_command(ctx, "Shuffle posted in this channel.")
+
+
+@bot.hybrid_command(
+    name='sdg_shuffle',
+    description='Move members into timed pairs/trios using roles `нашедшийся` and `core`'
+)
+async def sdg_shuffle(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_sdg_shuffle_access(ctx.author):
+        await ctx.send(
+            f"You do not have permission to start timed room shuffles. "
+            f"Required: {get_sdg_shuffle_access_label()}.",
+        )
+        return
+
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel to start SDG shuffle!")
+        return
+
+    anchor_channel = ctx.author.voice.channel
+    if not isinstance(anchor_channel, discord.VoiceChannel):
+        await ctx.send("SDG shuffle only works from a regular voice channel.")
+        return
+
+    participants = [member for member in anchor_channel.members if not member.bot]
+    if len(participants) < 2:
+        await ctx.send("Need at least 2 human members in your voice channel to start SDG shuffle.")
+        return
+
+    target_channels = get_sdg_target_voice_channels(guild, anchor_channel)
+    max_concurrent_groups = max(1, len(participants) // 2)
+    if len(target_channels) < max_concurrent_groups:
+        await ctx.send(
+            f"I found only {len(target_channels)} usable voice room(s) in this category, "
+            f"but up to {max_concurrent_groups} are needed for {len(participants)} participants.",
+        )
+        return
+    target_channels = target_channels[:max_concurrent_groups]
+
+    blocked_channels = [
+        channel.mention
+        for channel in target_channels
+        if not bot_can_move_members(guild, channel)
+    ]
+    if blocked_channels:
+        await ctx.send(
+            "I need the `Move Members` permission in all managed breakout rooms. "
+            "Please check: "
+            + ", ".join(blocked_channels[:10]),
+        )
+        return
+
+    existing_session = active_sdg_shuffles.get(guild.id)
+    replaced_existing = existing_session is not None
+    if existing_session is not None:
+        await stop_sdg_shuffle_session(
+            guild.id,
+            f"Stopped because **{ctx.author.display_name}** started a new SDG shuffle.",
+        )
+
+    session = {
+        "guild_id": guild.id,
+        "text_channel_id": getattr(ctx.channel, "id", None),
+        "anchor_voice_channel_id": anchor_channel.id,
+        "target_voice_channel_ids": [channel.id for channel in target_channels],
+        "participant_ids": {member.id for member in participants},
+        "paused_member_ids": set(),
+        "reserved_voice_numbers": set(),
+        "newcomers_with_core": set(),
+        "round_number": 1,
+        "last_round": None,
+        "next_round_at": None,
+        "message": None,
+        "task": None,
+    }
+
+    status_message = await ctx.channel.send(build_sdg_shuffle_content(session, guild))
+    session["message"] = status_message
+    active_sdg_shuffles[guild.id] = session
+    session["task"] = asyncio.create_task(run_sdg_shuffle_session(guild.id))
+
+    room_mentions = ", ".join(channel.mention for channel in target_channels[:10])
+    if len(target_channels) > 10:
+        room_mentions += ", ..."
+
+    confirmation = (
+        f"SDG shuffle started from `{anchor_channel.name}`. "
+        f"Managed rooms: {room_mentions}. "
+        f"Members with role `{SDG_NEWCOMER_ROLE_NAME}` stay together for 10 minutes; "
+        f"role `{SDG_CORE_ROLE_NAME}` acts as the old `**`; other groups reshuffle every 5 minutes."
+    )
+    if replaced_existing:
+        confirmation += " Previous SDG shuffle session was replaced."
+
+    await finish_hybrid_command(ctx, confirmation)
+
+
+@bot.hybrid_command(
+    name='sdg_shuffle_stop',
+    description='Stop the active timed SDG shuffle in this server'
+)
+async def sdg_shuffle_stop(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_sdg_shuffle_access(ctx.author):
+        await ctx.send(
+            f"You do not have permission to stop timed room shuffles. "
+            f"Required: {get_sdg_shuffle_access_label()}.",
+        )
+        return
+
+    stopped = await stop_sdg_shuffle_session(
+        guild.id,
+        f"Stopped by **{ctx.author.display_name}**.",
+    )
+    if not stopped:
+        await finish_hybrid_command(ctx, "No active SDG shuffle is running in this server.")
+        return
+
+    await finish_hybrid_command(ctx, "SDG shuffle stopped.")
 
 
 @bot.hybrid_command(

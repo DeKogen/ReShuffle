@@ -4,6 +4,7 @@ Discord bot that shuffles members in a voice channel, keeps a live order as peop
 
 ## Features
 - Shuffle members from your current voice channel with a hybrid command
+- Timed SDG breakout shuffle that physically moves members between rooms every 5 minutes
 - Live-updating list that reacts to joins/leaves
 - Schedule a voice event that auto-starts and auto-completes shuffle
 - Attach shuffle to existing scheduled events
@@ -35,6 +36,8 @@ python Shuffle.py
 
 ## Commands
 - `/shuffle [exclude]` (or `!shuffle [exclude]`) - shuffle members in your current voice channel; users with `Товарищ` or `надежный` can exclude members by mention, ID, or exact name
+- `/sdg_shuffle` - start timed breakout-room shuffling from your current voice channel; role `нашедшийся` stays together for 10 minutes, role `core` works like the old `**`, everyone else reshuffles every 5 minutes
+- `/sdg_shuffle_stop` - stop the active timed SDG shuffle in the server
 - `/shuffle_exclude_add <users>` - add users to a persistent exclusion list for all future shuffles; only `Товарищ` or `надежный`
 - `/shuffle_exclude_remove <users>` - remove users from the persistent exclusion list; only `Товарищ` or `надежный`
 - `/shuffle_exclude_list` - show the current persistent exclusion list; only `Товарищ` or `надежный`
@@ -55,6 +58,8 @@ python Shuffle.py
 - `DISCORD_TOKEN` (required)
 - `RELIABLE_ROLE_ID` (optional) - numeric role ID; if unset, edit `RELIABLE_ROLE_NAME` in `Shuffle.py`
 - `TRUSTED_ROLE_ID` (optional) - numeric role ID; if unset, edit `TRUSTED_ROLE_NAME` in `Shuffle.py`
+- `SDG_NEWCOMER_ROLE_ID` (optional) - numeric role ID for `нашедшийся`; if unset, the bot matches by role name
+- `SDG_CORE_ROLE_ID` (optional) - numeric role ID for `core`; if unset, the bot matches by role name
 - `RESHUFFLE_DATA_DIR` (optional) - writable directory for runtime state files; useful in Docker
 
 ## Voice Tracking Storage
