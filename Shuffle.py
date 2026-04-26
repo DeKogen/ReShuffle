@@ -2617,21 +2617,20 @@ def collect_sdg_present_members(
     session: dict,
     guild: discord.Guild,
 ) -> dict[int, discord.Member]:
-    """Collect tracked participants who are currently inside the managed rooms."""
+    """Collect all human members currently inside the managed SDG voice rooms."""
     tracked_channel_ids = set(session.get("target_voice_channel_ids", []))
     tracked_channel_ids.add(session.get("anchor_voice_channel_id"))
     present_members: dict[int, discord.Member] = {}
 
-    for member_id in session["participant_ids"]:
-        member = guild.get_member(member_id)
-        if member is None or member.bot:
+    for channel_id in tracked_channel_ids:
+        channel = guild.get_channel(channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
             continue
-        member_voice = member.voice
-        if member_voice is None or member_voice.channel is None:
-            continue
-        if member_voice.channel.id not in tracked_channel_ids:
-            continue
-        present_members[member_id] = member
+
+        for member in channel.members:
+            if member.bot:
+                continue
+            present_members[member.id] = member
 
     return present_members
 
@@ -2933,6 +2932,7 @@ async def run_sdg_shuffle_session(guild_id: int) -> None:
                 return
 
             present_members = collect_sdg_present_members(session, guild)
+            session["participant_ids"] = set(present_members)
             round_info = build_sdg_next_round(session, present_members)
             move_errors = await move_sdg_groups_for_round(session, guild, round_info)
             session["next_round_at"] = utc_now() + timedelta(seconds=SDG_ROUND_SECONDS)
