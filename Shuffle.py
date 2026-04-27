@@ -2613,29 +2613,110 @@ def resolve_sdg_voice_channel(
     return None
 
 
+def resolve_sdg_voice_number(
+    session: dict,
+    channel_id: int,
+) -> Optional[int]:
+    """Map a real Discord voice-channel ID back to the logical SDG room number."""
+    channel_ids = session.get("target_voice_channel_ids", [])
+    try:
+        return channel_ids.index(channel_id) + 1
+    except ValueError:
+        return None
+
+
 def collect_sdg_present_members(
     session: dict,
     guild: discord.Guild,
-) -> dict[int, discord.Member]:
+) -> tuple[dict[int, discord.Member], dict[int, list[int]]]:
     """Collect all human members currently inside the managed SDG voice rooms."""
-    tracked_channel_ids = set(session.get("target_voice_channel_ids", []))
-    tracked_channel_ids.add(session.get("anchor_voice_channel_id"))
+    tracked_channel_ids: list[int] = []
+    seen_channel_ids: set[int] = set()
+
+    for channel_id in session.get("target_voice_channel_ids", []):
+        if channel_id in seen_channel_ids:
+            continue
+        tracked_channel_ids.append(channel_id)
+        seen_channel_ids.add(channel_id)
+
+    anchor_channel_id = session.get("anchor_voice_channel_id")
+    if anchor_channel_id is not None and anchor_channel_id not in seen_channel_ids:
+        tracked_channel_ids.append(anchor_channel_id)
+
     present_members: dict[int, discord.Member] = {}
+    present_member_ids_by_channel: dict[int, list[int]] = {}
 
     for channel_id in tracked_channel_ids:
         channel = guild.get_channel(channel_id)
         if not isinstance(channel, discord.VoiceChannel):
             continue
 
+        channel_member_ids: list[int] = []
         for member in channel.members:
             if member.bot:
                 continue
             present_members[member.id] = member
+            channel_member_ids.append(member.id)
 
-    return present_members
+        if channel_member_ids:
+            present_member_ids_by_channel[channel.id] = channel_member_ids
+
+    return present_members, present_member_ids_by_channel
 
 
-def build_sdg_next_round(session: dict, present_members: dict[int, discord.Member]) -> dict:
+def build_sdg_current_holding_groups(
+    session: dict,
+    present_member_ids_by_channel: dict[int, list[int]],
+    paused_now_ids: set[int],
+    newcomer_member_ids: set[int],
+) -> tuple[list[dict], set[int], set[int]]:
+    """
+    Rebuild active 10-minute holds from the real room layout.
+
+    This lets the next round react to manual room switches, leavers, and
+    joiners instead of trusting the previous bot assignment forever.
+    """
+    holding_groups: list[dict] = []
+    held_member_ids: set[int] = set()
+    reserved_voice_numbers: set[int] = set()
+
+    for channel_id in session.get("target_voice_channel_ids", []):
+        member_ids = present_member_ids_by_channel.get(channel_id, [])
+        if len(member_ids) < 2:
+            continue
+
+        paused_member_ids = [
+            member_id
+            for member_id in member_ids
+            if member_id in paused_now_ids
+        ]
+        if not paused_member_ids:
+            continue
+
+        if not any(member_id in newcomer_member_ids for member_id in paused_member_ids):
+            continue
+
+        voice_number = resolve_sdg_voice_number(session, channel_id)
+        if voice_number is None:
+            continue
+
+        holding_groups.append(
+            {
+                "member_ids": list(member_ids),
+                "voice": voice_number,
+            }
+        )
+        held_member_ids.update(member_ids)
+        reserved_voice_numbers.add(voice_number)
+
+    return holding_groups, held_member_ids, reserved_voice_numbers
+
+
+def build_sdg_next_round(
+    session: dict,
+    present_members: dict[int, discord.Member],
+    present_member_ids_by_channel: dict[int, list[int]],
+) -> dict:
     """Advance the SDG state machine by one 5-minute round."""
     display_names_by_id = {
         member_id: member.display_name
@@ -2658,27 +2739,17 @@ def build_sdg_next_round(session: dict, present_members: dict[int, discord.Membe
         if member_id in present_members
     }
 
-    holding_groups = []
-    last_round = session.get("last_round")
-    if last_round:
-        for group in last_round.get("groups", []):
-            group_member_ids = [
-                member_id
-                for member_id in group["member_ids"]
-                if member_id in paused_now_ids
-            ]
-            if group_member_ids:
-                holding_groups.append(
-                    {
-                        "member_ids": group_member_ids,
-                        "voice": group["voice"],
-                    }
-                )
+    holding_groups, held_member_ids, reserved_voices_now = build_sdg_current_holding_groups(
+        session,
+        present_member_ids_by_channel,
+        paused_now_ids,
+        newcomer_member_ids,
+    )
 
     active_member_ids = [
         member_id
         for member_id in present_member_ids
-        if member_id not in paused_now_ids
+        if member_id not in held_member_ids
     ]
 
     if len(active_member_ids) >= 2:
@@ -2693,7 +2764,7 @@ def build_sdg_next_round(session: dict, present_members: dict[int, discord.Membe
         raw_groups = []
         met_core_this_round = set()
 
-    groups = sdg_assign_voices(raw_groups, session["reserved_voice_numbers"])
+    groups = sdg_assign_voices(raw_groups, reserved_voices_now)
     paused_next, reserved_voices_next = sdg_get_next_round_paused(
         groups,
         newcomer_member_ids,
@@ -2704,7 +2775,7 @@ def build_sdg_next_round(session: dict, present_members: dict[int, discord.Membe
         "groups": groups,
         "holding_groups": holding_groups,
         "paused_now_ids": sdg_sort_member_ids(
-            list(paused_now_ids),
+            list(held_member_ids),
             display_names_by_id,
         ),
         "display_names_by_id": display_names_by_id,
@@ -2931,19 +3002,26 @@ async def run_sdg_shuffle_session(guild_id: int) -> None:
                 )
                 return
 
-            present_members = collect_sdg_present_members(session, guild)
+            present_members, present_member_ids_by_channel = collect_sdg_present_members(
+                session,
+                guild,
+            )
             session["participant_ids"] = set(present_members)
-            round_info = build_sdg_next_round(session, present_members)
+            round_info = build_sdg_next_round(
+                session,
+                present_members,
+                present_member_ids_by_channel,
+            )
             move_errors = await move_sdg_groups_for_round(session, guild, round_info)
             session["next_round_at"] = utc_now() + timedelta(seconds=SDG_ROUND_SECONDS)
 
             await edit_sdg_shuffle_message(
                 session,
-                build_sdg_shuffle_content(
-                    session,
-                    guild,
-                    round_info,
-                    move_errors=move_errors,
+            build_sdg_shuffle_content(
+                session,
+                guild,
+                round_info,
+                move_errors=move_errors,
                 ),
             )
 
