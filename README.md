@@ -74,3 +74,11 @@ python Shuffle.py
 docker build -t reshuffle .
 docker run --env-file .env reshuffle
 ```
+
+For persistent runtime state with Docker Compose:
+
+```bash
+docker compose up --build -d
+```
+
+The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, audit logs, and the SQLite voice activity database survive container recreation.

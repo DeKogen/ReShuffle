@@ -145,10 +145,14 @@ cython_debug/
 
 # Discord bot specific
 config.json
+data/
 *.db
 voice_activity.sqlite3
 voice_activity.sqlite3-*
 event_text_channel_targets.json
+persistent_shuffle_exclusions.json
+shuffle_settings.json
+shuffle_admin_audit.jsonl
 logs/
 *.log.*
 

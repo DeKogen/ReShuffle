@@ -19,6 +19,7 @@ WORKDIR /app
 
 # Create non-root user
 RUN useradd -m -u 1000 botuser
+RUN mkdir -p /data && chown botuser:botuser /data
 
 # Copy installed packages from builder
 COPY --from=builder /root/.local /home/botuser/.local
@@ -31,6 +32,7 @@ USER botuser
 
 # Add local bin to PATH
 ENV PATH=/home/botuser/.local/bin:$PATH
+ENV RESHUFFLE_DATA_DIR=/data
 
 # Run the bot
 CMD ["python", "-u", "Shuffle.py"]

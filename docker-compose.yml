@@ -1,0 +1,13 @@
+services:
+  reshuffle:
+    build: .
+    env_file:
+      - .env
+    environment:
+      RESHUFFLE_DATA_DIR: /data
+    volumes:
+      - reshuffle_data:/data
+    restart: unless-stopped
+
+volumes:
+  reshuffle_data:
