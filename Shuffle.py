@@ -8,8 +8,7 @@ from datetime import datetime, timedelta, timezone
 import os
 import re
 import traceback
-from functools import lru_cache
-from itertools import combinations_with_replacement
+from itertools import combinations
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -55,7 +54,12 @@ FROZEN_EVENT_MARKER = "[замороженно]"
 CAMERA_SOURCE_MANUAL = "manual"
 CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
 SDG_NEWCOMER_DAYS_THRESHOLD = 10
-SDG_CATEGORY_KEYS = ("fd", "fo", "sn", "c", "t", "a", "r")
+SDG_FRESH_STAGE_COUNT = 18
+SDG_REPEAT_PARTNER_SCORE_INDEX = SDG_FRESH_STAGE_COUNT
+SDG_FRESH_TRIO_OVERLAP_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 1
+SDG_FRESH_IN_TRIO_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 2
+SDG_HIGHER_ROLE_STACK_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 3
+SDG_PLAN_SCORE_SIZE = SDG_FRESH_STAGE_COUNT + 4
 
 
 def resolve_data_dir() -> str:
@@ -2366,16 +2370,20 @@ def sdg_build_member_profile(
         and has_reliable_role(member)
     )
 
+    higher_role_rank = None
     if is_core:
         category = "c"
+        higher_role_rank = 0
     elif is_fresh_newcomer:
-        category = "fo"
+        category = "f"
     elif is_seasoned_newcomer:
         category = "sn"
     elif is_trusted:
         category = "t"
+        higher_role_rank = 1
     elif is_reliable:
         category = "a"
+        higher_role_rank = 2
     else:
         category = "r"
 
@@ -2386,34 +2394,10 @@ def sdg_build_member_profile(
         "is_newcomer": is_newcomer,
         "is_fresh_newcomer": is_fresh_newcomer,
         "is_seasoned_newcomer": is_seasoned_newcomer,
-        "gets_extended_mentor_slot": (
-            is_newcomer
-            and joined_days is not None
-            and joined_days <= SDG_NEWCOMER_DAYS_THRESHOLD
-        ),
         "is_trusted": is_trusted,
         "is_reliable": is_reliable,
-        "is_priority_partner": category in {"c", "t", "a"},
+        "higher_role_rank": higher_role_rank,
     }
-
-
-def sdg_target_core_rounds_after_next_slot(completed_slots: int) -> int:
-    """Keep fresh newcomers with `core` in roughly every other round slot."""
-    return (completed_slots + 2) // 2
-
-
-def sdg_member_needs_core_this_round(session: dict, member_id: int) -> bool:
-    """Return whether a fresh newcomer is currently below the 50% core target."""
-    rounds_seen = session.get("fresh_newcomer_round_counts", {}).get(member_id, 0)
-    core_rounds = session.get("fresh_newcomer_core_round_counts", {}).get(member_id, 0)
-    return core_rounds < sdg_target_core_rounds_after_next_slot(rounds_seen)
-
-
-def sdg_get_planning_category(session: dict, member_id: int, profile: dict) -> str:
-    """Return the dynamic category used by the current round planner."""
-    if profile["is_fresh_newcomer"]:
-        return "fd" if sdg_member_needs_core_this_round(session, member_id) else "fo"
-    return profile["category"]
 
 
 def sdg_visible_name(name: str) -> str:
@@ -2435,220 +2419,324 @@ def sdg_sort_member_ids(member_ids: list[int], display_names_by_id: dict[int, st
     )
 
 
-def sdg_can_apply_template(counts: dict[str, int], template: dict) -> bool:
-    """Check whether one template can be applied to the remaining participant buckets."""
-    return all(counts[key] >= needed for key, needed in template["counts"].items())
+def sdg_make_empty_plan_score() -> list[int]:
+    """Create a mutable score vector for one SDG plan candidate."""
+    return [0] * SDG_PLAN_SCORE_SIZE
 
 
-def sdg_newcomer_partner_penalty(category: str, template_counts: dict[str, int]) -> int:
-    """Score partner quality for one newcomer category inside a group."""
-    if category == "fd":
-        if template_counts["c"] > 0:
-            return 0
-        if template_counts["t"] > 0:
-            return 4
-        if template_counts["a"] > 0:
-            return 6
-        if template_counts["r"] > 0:
-            return 8
-        return 14
-
-    if category == "fo":
-        if template_counts["t"] > 0:
-            return 0
-        if template_counts["a"] > 0:
-            return 1
-        if template_counts["c"] > 0:
-            return 2
-        if template_counts["r"] > 0:
-            return 3
-        return 10
-
-    if template_counts["c"] > 0:
-        return 0
-    if template_counts["t"] > 0:
-        return 1
-    if template_counts["a"] > 0:
-        return 2
-    if template_counts["r"] > 0:
-        return 3
-    return 10
+def sdg_add_plan_scores(left: tuple[int, ...], right: tuple[int, ...]) -> tuple[int, ...]:
+    """Combine two immutable SDG plan scores component-wise."""
+    return tuple(left[index] + right[index] for index in range(SDG_PLAN_SCORE_SIZE))
 
 
-def sdg_score_group_template(template_counts: dict[str, int]) -> tuple[int, int, int, int, int]:
-    """Score one pair/trio template so pairs and strong newcomer partners win first."""
-    group_size = sum(template_counts.values())
-    newcomer_count = template_counts["fd"] + template_counts["fo"] + template_counts["sn"]
-    trio_penalty = 1 if group_size == 3 else 0
-
-    if newcomer_count == 0:
-        stacked_priority_roles = max(
-            0,
-            template_counts["c"] + template_counts["t"] + template_counts["a"] - 1,
-        )
-        return (trio_penalty, 0, 0, 0, stacked_priority_roles)
-
-    overlap_penalty = 3 * max(0, newcomer_count - 1)
-    trio_offset = 4 if group_size == 3 else 0
-    stacked_priority_roles = max(
-        0,
-        template_counts["c"] + template_counts["t"] + template_counts["a"] - newcomer_count,
-    )
-    due_fresh_penalty = (
-        sdg_newcomer_partner_penalty("fd", template_counts) + overlap_penalty + trio_offset
-    )
-    optional_fresh_penalty = (
-        sdg_newcomer_partner_penalty("fo", template_counts) + overlap_penalty + trio_offset
-    )
-    seasoned_newcomer_penalty = (
-        sdg_newcomer_partner_penalty("sn", template_counts) + overlap_penalty + trio_offset
-    )
-    return (
-        trio_penalty,
-        template_counts["fd"] * due_fresh_penalty,
-        template_counts["fo"] * optional_fresh_penalty,
-        template_counts["sn"] * seasoned_newcomer_penalty,
-        stacked_priority_roles,
-    )
+def sdg_get_seen_partner_ids(session: dict, member_id: int) -> set[int]:
+    """Return partners this fresh newcomer has already met in the current SDG session."""
+    return set(session.get("fresh_newcomer_partner_history", {}).get(member_id, set()))
 
 
-def sdg_build_group_templates() -> list[dict]:
-    """Enumerate every possible pair/trio template over the SDG role buckets."""
-    templates = []
-    for group_size in (2, 3):
-        for combination in combinations_with_replacement(SDG_CATEGORY_KEYS, group_size):
-            counts = {key: 0 for key in SDG_CATEGORY_KEYS}
-            for key in combination:
-                counts[key] += 1
-            templates.append(
-                {
-                    "counts": counts,
-                    "score": sdg_score_group_template(counts),
-                }
-            )
+def sdg_pick_best_higher_role_partner(
+    session: dict,
+    fresh_member_id: int,
+    candidate_partner_ids: list[int],
+    member_profiles_by_id: dict[int, dict],
+) -> Optional[int]:
+    """Choose the best higher-role partner by role priority first, novelty second."""
+    seen_partner_ids = sdg_get_seen_partner_ids(session, fresh_member_id)
+    higher_role_partner_ids = [
+        partner_id
+        for partner_id in candidate_partner_ids
+        if member_profiles_by_id[partner_id]["higher_role_rank"] is not None
+    ]
+    if not higher_role_partner_ids:
+        return None
 
-    return sorted(
-        templates,
-        key=lambda template: (
-            template["score"],
-            sum(template["counts"].values()),
-            tuple(template["counts"][key] for key in SDG_CATEGORY_KEYS),
+    return min(
+        higher_role_partner_ids,
+        key=lambda partner_id: (
+            member_profiles_by_id[partner_id]["higher_role_rank"],
+            partner_id in seen_partner_ids,
+            partner_id,
         ),
     )
 
 
-SDG_GROUP_TEMPLATES = sdg_build_group_templates()
-
-
-def sdg_subtract_counts(
-    counts: dict[str, int],
-    template: dict,
-) -> tuple[int, int, int, int, int, int]:
-    """Subtract a template from the remaining SDG category counts."""
-    next_counts = dict(counts)
-    for key, needed in template["counts"].items():
-        next_counts[key] -= needed
-    return tuple(next_counts[key] for key in SDG_CATEGORY_KEYS)
-
-
-@lru_cache(maxsize=None)
-def sdg_find_group_plan(
-    due_fresh_newcomers_count: int,
-    optional_fresh_newcomers_count: int,
-    seasoned_newcomers_count: int,
-    core_count: int,
-    trusted_count: int,
-    reliable_count: int,
-    regulars_count: int,
-):
-    """Find the best group template sequence for one round."""
-    counts = dict(
-        zip(
-            SDG_CATEGORY_KEYS,
-            (
-                due_fresh_newcomers_count,
-                optional_fresh_newcomers_count,
-                seasoned_newcomers_count,
-                core_count,
-                trusted_count,
-                reliable_count,
-                regulars_count,
-            ),
-        )
+def sdg_get_fresh_group_stage(
+    session: dict,
+    fresh_member_id: int,
+    group_member_ids: tuple[int, ...],
+    member_profiles_by_id: dict[int, dict],
+) -> int:
+    """Classify one fresh newcomer's outcome inside a candidate pair/trio."""
+    other_member_ids = [
+        member_id for member_id in group_member_ids
+        if member_id != fresh_member_id
+    ]
+    higher_role_partner_id = sdg_pick_best_higher_role_partner(
+        session,
+        fresh_member_id,
+        other_member_ids,
+        member_profiles_by_id,
     )
 
-    if all(value == 0 for value in counts.values()):
-        return (0, 0, 0, 0, 0), []
-
-    best_score = None
-    best_plan = None
-
-    for template in SDG_GROUP_TEMPLATES:
-        if not sdg_can_apply_template(counts, template):
-            continue
-
-        next_state = sdg_subtract_counts(counts, template)
-        child = sdg_find_group_plan(*next_state)
-        if child is None:
-            continue
-
-        child_score, child_plan = child
-        current_score = tuple(
-            template["score"][index] + child_score[index]
-            for index in range(len(template["score"]))
+    if higher_role_partner_id is not None:
+        partner_profile = member_profiles_by_id[higher_role_partner_id]
+        partner_seen_before = higher_role_partner_id in sdg_get_seen_partner_ids(
+            session,
+            fresh_member_id,
         )
-        current_plan = [template] + child_plan
+        base_stage = partner_profile["higher_role_rank"] * 2 + int(partner_seen_before)
+        if len(group_member_ids) == 2:
+            return base_stage
+        return 6 + base_stage
 
-        if best_score is None or current_score < best_score:
-            best_score = current_score
-            best_plan = current_plan
+    if len(group_member_ids) == 2:
+        if any(
+            member_profiles_by_id[member_id]["is_seasoned_newcomer"]
+            for member_id in other_member_ids
+        ):
+            return 12
+        if any(
+            member_profiles_by_id[member_id]["category"] == "r"
+            for member_id in other_member_ids
+        ):
+            return 13
+        return 16
 
-    if best_score is None:
-        return None
+    if any(
+        member_profiles_by_id[member_id]["is_seasoned_newcomer"]
+        for member_id in other_member_ids
+    ):
+        return 14
+    if any(
+        member_profiles_by_id[member_id]["category"] == "r"
+        for member_id in other_member_ids
+    ):
+        return 15
+    return 17
 
-    return best_score, best_plan
+
+def sdg_score_group_plan(
+    session: dict,
+    group_member_ids: tuple[int, ...],
+    member_profiles_by_id: dict[int, dict],
+) -> tuple[int, ...]:
+    """Score one exact pair/trio so worse fresh-newcomer outcomes lose first."""
+    score_parts = sdg_make_empty_plan_score()
+    fresh_member_ids = [
+        member_id
+        for member_id in group_member_ids
+        if member_profiles_by_id[member_id]["is_fresh_newcomer"]
+    ]
+    higher_role_member_ids = [
+        member_id
+        for member_id in group_member_ids
+        if member_profiles_by_id[member_id]["higher_role_rank"] is not None
+    ]
+
+    for fresh_member_id in fresh_member_ids:
+        stage = sdg_get_fresh_group_stage(
+            session,
+            fresh_member_id,
+            group_member_ids,
+            member_profiles_by_id,
+        )
+        score_parts[SDG_FRESH_STAGE_COUNT - 1 - stage] += 1
+
+        seen_partner_ids = sdg_get_seen_partner_ids(session, fresh_member_id)
+        repeated_partner_count = sum(
+            1
+            for member_id in group_member_ids
+            if member_id != fresh_member_id and member_id in seen_partner_ids
+        )
+        score_parts[SDG_REPEAT_PARTNER_SCORE_INDEX] += repeated_partner_count
+
+    if len(group_member_ids) == 3:
+        score_parts[SDG_FRESH_IN_TRIO_SCORE_INDEX] += len(fresh_member_ids)
+        if len(fresh_member_ids) >= 2:
+            score_parts[SDG_FRESH_TRIO_OVERLAP_SCORE_INDEX] += len(fresh_member_ids)
+
+    score_parts[SDG_HIGHER_ROLE_STACK_SCORE_INDEX] += max(0, len(higher_role_member_ids) - 1)
+    return tuple(score_parts)
 
 
-def sdg_make_groups(
+def sdg_count_available_higher_role_options(
+    session: dict,
+    fresh_member_id: int,
+    remaining_member_ids: tuple[int, ...],
+    member_profiles_by_id: dict[int, dict],
+) -> tuple[int, int, int]:
+    """Measure how many better partners a fresh newcomer can still reach this round."""
+    seen_partner_ids = sdg_get_seen_partner_ids(session, fresh_member_id)
+    unseen_higher_role_options = 0
+    total_higher_role_options = 0
+    seasoned_newcomer_options = 0
+
+    for member_id in remaining_member_ids:
+        if member_id == fresh_member_id:
+            continue
+        profile = member_profiles_by_id[member_id]
+        if profile["higher_role_rank"] is not None:
+            total_higher_role_options += 1
+            if member_id not in seen_partner_ids:
+                unseen_higher_role_options += 1
+        elif profile["is_seasoned_newcomer"]:
+            seasoned_newcomer_options += 1
+
+    return (
+        unseen_higher_role_options,
+        total_higher_role_options,
+        seasoned_newcomer_options,
+    )
+
+
+def sdg_pick_group_pivot(
+    session: dict,
+    remaining_member_ids: tuple[int, ...],
+    member_profiles_by_id: dict[int, dict],
+) -> int:
+    """Pick the next member to group, prioritizing the most constrained fresh newcomer."""
+    fresh_member_ids = [
+        member_id
+        for member_id in remaining_member_ids
+        if member_profiles_by_id[member_id]["is_fresh_newcomer"]
+    ]
+    if not fresh_member_ids:
+        return remaining_member_ids[0]
+
+    return min(
+        fresh_member_ids,
+        key=lambda member_id: (
+            *sdg_count_available_higher_role_options(
+                session,
+                member_id,
+                remaining_member_ids,
+                member_profiles_by_id,
+            ),
+            member_id,
+        ),
+    )
+
+
+def sdg_generate_group_candidates(
+    session: dict,
+    pivot_member_id: int,
+    remaining_member_ids: tuple[int, ...],
+    member_profiles_by_id: dict[int, dict],
+    trio_slots_left: int,
+) -> list[tuple[tuple[int, ...], tuple[int, ...]]]:
+    """Enumerate candidate pairs/trios for the current pivot member, best first."""
+    other_member_ids = [
+        member_id
+        for member_id in remaining_member_ids
+        if member_id != pivot_member_id
+    ]
+    candidates: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+
+    for partner_id in other_member_ids:
+        group_member_ids = tuple(sorted((pivot_member_id, partner_id)))
+        candidates.append(
+            (
+                sdg_score_group_plan(session, group_member_ids, member_profiles_by_id),
+                group_member_ids,
+            )
+        )
+
+    if trio_slots_left > 0:
+        for second_id, third_id in combinations(other_member_ids, 2):
+            group_member_ids = tuple(sorted((pivot_member_id, second_id, third_id)))
+            candidates.append(
+                (
+                    sdg_score_group_plan(session, group_member_ids, member_profiles_by_id),
+                    group_member_ids,
+                )
+            )
+
+    return sorted(
+        candidates,
+        key=lambda item: (item[0], len(item[1]), item[1]),
+    )
+
+
+def sdg_count_required_trios(member_count: int, available_room_count: int) -> int:
+    """Return the minimum number of trios needed for this headcount/room budget."""
+    if member_count < 2:
+        return 0
+
+    minimum_room_count = (member_count + 2) // 3
+    if available_room_count < minimum_room_count:
+        raise ValueError(
+            f"Need at least {minimum_room_count} SDG voice room(s) for {member_count} members, "
+            f"but only {available_room_count} are available."
+        )
+
+    return max(member_count % 2, member_count - 2 * available_room_count)
+
+
+def sdg_optimize_member_groups(
+    session: dict,
     member_ids: list[int],
     member_profiles_by_id: dict[int, dict],
-) -> list[list[int]]:
-    """Build SDG pairs/trios for the active members of one round."""
-    pools = {key: [] for key in SDG_CATEGORY_KEYS}
-    for member_id in member_ids:
-        category = member_profiles_by_id[member_id]["planning_category"]
-        pools[category].append(member_id)
+    required_trio_count: int,
+) -> Optional[tuple[tuple[int, ...], list[list[int]]]]:
+    """Build the best exact pair/trio partition for the current active members."""
+    cache: dict[tuple[tuple[int, ...], int], Optional[tuple[tuple[int, ...], list[list[int]]]]] = {}
+    initial_member_ids = tuple(sorted(member_ids))
 
-    for pool in pools.values():
-        random.shuffle(pool)
+    def solve(
+        remaining_member_ids: tuple[int, ...],
+        trio_slots_left: int,
+    ) -> Optional[tuple[tuple[int, ...], list[list[int]]]]:
+        if not remaining_member_ids:
+            if trio_slots_left == 0:
+                return (tuple(0 for _ in range(SDG_PLAN_SCORE_SIZE)), [])
+            return None
 
-    plan_result = sdg_find_group_plan(
-        *(len(pools[key]) for key in SDG_CATEGORY_KEYS)
-    )
-    if plan_result is None:
-        raise ValueError("Could not build groups for the current participant set.")
+        if len(remaining_member_ids) < trio_slots_left * 3:
+            return None
+        if (len(remaining_member_ids) - trio_slots_left * 3) % 2 != 0:
+            return None
 
-    _, plan = plan_result
-    groups: list[list[int]] = []
+        cache_key = (remaining_member_ids, trio_slots_left)
+        if cache_key in cache:
+            return cache[cache_key]
 
-    def pop_from_pool(pool_key: str) -> int:
-        pool = pools[pool_key]
-        if not pool:
-            raise ValueError("The SDG plan could not be fulfilled for this round.")
-        return pool.pop()
+        pivot_member_id = sdg_pick_group_pivot(
+            session,
+            remaining_member_ids,
+            member_profiles_by_id,
+        )
+        candidates = sdg_generate_group_candidates(
+            session,
+            pivot_member_id,
+            remaining_member_ids,
+            member_profiles_by_id,
+            trio_slots_left,
+        )
 
-    for template in plan:
-        group: list[int] = []
-        for pool_key in SDG_CATEGORY_KEYS:
-            amount = template["counts"][pool_key]
-            for _ in range(amount):
-                group.append(pop_from_pool(pool_key))
+        best_result = None
+        for group_score, group_member_ids in candidates:
+            next_trio_slots_left = trio_slots_left - (1 if len(group_member_ids) == 3 else 0)
+            group_member_id_set = set(group_member_ids)
+            next_remaining_member_ids = tuple(
+                member_id
+                for member_id in remaining_member_ids
+                if member_id not in group_member_id_set
+            )
+            child_result = solve(next_remaining_member_ids, next_trio_slots_left)
+            if child_result is None:
+                continue
 
-        random.shuffle(group)
-        groups.append(group)
+            child_score, child_groups = child_result
+            total_score = sdg_add_plan_scores(group_score, child_score)
+            total_groups = [list(group_member_ids)] + child_groups
 
-    random.shuffle(groups)
-    return groups
+            if best_result is None or total_score < best_result[0]:
+                best_result = (total_score, total_groups)
+
+        cache[cache_key] = best_result
+        return best_result
+
+    return solve(initial_member_ids, required_trio_count)
 
 
 def sdg_assign_voices(groups: list[list[int]], reserved_voices: set[int]) -> list[dict]:
@@ -2727,6 +2815,21 @@ def get_sdg_target_voice_channels(
     return sorted(channels, key=sdg_voice_channel_sort_key)
 
 
+def refresh_sdg_target_voice_channels(
+    session: dict,
+    guild: discord.Guild,
+) -> list[discord.VoiceChannel]:
+    """Refresh the managed SDG breakout-room list from the anchor room's category."""
+    anchor_channel = guild.get_channel(session.get("anchor_voice_channel_id"))
+    if not isinstance(anchor_channel, discord.VoiceChannel):
+        session["target_voice_channel_ids"] = []
+        return []
+
+    target_channels = get_sdg_target_voice_channels(guild, anchor_channel)
+    session["target_voice_channel_ids"] = [channel.id for channel in target_channels]
+    return target_channels
+
+
 def resolve_sdg_voice_channel(
     session: dict,
     guild: discord.Guild,
@@ -2799,43 +2902,44 @@ def sdg_should_hold_group(
     member_ids: list[int],
     member_profiles_by_id: dict[int, dict],
 ) -> bool:
-    """Hold only eligible newcomer groups that should get a full 10-minute mentor slot."""
-    has_extended_slot_newcomer = any(
-        member_profiles_by_id.get(member_id, {}).get("gets_extended_mentor_slot", False)
+    """Hold only fresh-newcomer pairs that also include a higher-role partner."""
+    if len(member_ids) != 2:
+        return False
+
+    has_fresh_newcomer = any(
+        member_profiles_by_id.get(member_id, {}).get("is_fresh_newcomer", False)
         for member_id in member_ids
     )
-    if not has_extended_slot_newcomer:
+    if not has_fresh_newcomer:
         return False
 
     return any(
-        member_profiles_by_id.get(member_id, {}).get("is_priority_partner", False)
+        member_profiles_by_id.get(member_id, {}).get("higher_role_rank") is not None
         for member_id in member_ids
     )
 
 
-def sdg_record_round_history(
+def sdg_record_partner_history(
     session: dict,
     round_groups: list[dict],
     member_profiles_by_id: dict[int, dict],
 ) -> None:
-    """Track how often fresh newcomers spend a round slot with `core`."""
-    round_counts = session.setdefault("fresh_newcomer_round_counts", {})
-    core_round_counts = session.setdefault("fresh_newcomer_core_round_counts", {})
+    """Remember who each fresh newcomer has already met in this SDG session."""
+    partner_history = session.setdefault("fresh_newcomer_partner_history", {})
 
     for group in round_groups:
         member_ids = group["member_ids"]
-        has_core = any(
-            member_profiles_by_id.get(member_id, {}).get("is_core", False)
-            for member_id in member_ids
-        )
         for member_id in member_ids:
             profile = member_profiles_by_id.get(member_id)
             if profile is None or not profile["is_fresh_newcomer"]:
                 continue
 
-            round_counts[member_id] = round_counts.get(member_id, 0) + 1
-            if has_core:
-                core_round_counts[member_id] = core_round_counts.get(member_id, 0) + 1
+            seen_partners = partner_history.setdefault(member_id, set())
+            seen_partners.update(
+                other_member_id
+                for other_member_id in member_ids
+                if other_member_id != member_id
+            )
 
 
 def build_sdg_current_holding_groups(
@@ -2896,8 +3000,6 @@ def build_sdg_next_round(
         member_id: sdg_build_member_profile(member, reference_time=reference_time)
         for member_id, member in present_members.items()
     }
-    for member_id, profile in member_profiles_by_id.items():
-        profile["planning_category"] = sdg_get_planning_category(session, member_id, profile)
 
     present_member_ids = list(present_members.keys())
     paused_now_ids = {
@@ -2920,15 +3022,29 @@ def build_sdg_next_round(
     ]
 
     if len(active_member_ids) >= 2:
-        raw_groups = sdg_make_groups(
+        available_room_count = max(
+            0,
+            len(session.get("target_voice_channel_ids", [])) - len(reserved_voices_now),
+        )
+        required_trio_count = sdg_count_required_trios(
+            len(active_member_ids),
+            available_room_count,
+        )
+        optimized_plan = sdg_optimize_member_groups(
+            session,
             active_member_ids,
             member_profiles_by_id,
+            required_trio_count,
         )
+        if optimized_plan is None:
+            raise ValueError("The SDG plan could not be fulfilled for this round.")
+
+        _, raw_groups = optimized_plan
     else:
         raw_groups = []
 
     groups = sdg_assign_voices(raw_groups, reserved_voices_now)
-    paused_next, reserved_voices_next = sdg_get_next_round_paused(
+    paused_next, _reserved_voices_next = sdg_get_next_round_paused(
         groups,
         member_profiles_by_id,
     )
@@ -2945,15 +3061,13 @@ def build_sdg_next_round(
         "present_member_ids": set(present_member_ids),
     }
 
-    sdg_record_round_history(
+    sdg_record_partner_history(
         session,
         holding_groups + groups,
         member_profiles_by_id,
     )
     session["paused_member_ids"] = paused_next
-    session["reserved_voice_numbers"] = reserved_voices_next
     session["round_number"] += 1
-    session["last_round"] = {"groups": groups}
 
     return round_info
 
@@ -3012,8 +3126,8 @@ def build_sdg_shuffle_content(
     if round_info["holding_groups"]:
         lines.append(
             f"Holding for the second 5-minute slot "
-            f"(role `{SDG_NEWCOMER_ROLE_NAME}` with {SDG_NEWCOMER_DAYS_THRESHOLD} or fewer days "
-            f"with `{SDG_CORE_ROLE_NAME}`, `{TRUSTED_ROLE_NAME}`, or `{RELIABLE_ROLE_NAME}`):"
+            f"(a fresh `{SDG_NEWCOMER_ROLE_NAME}` paired with `{SDG_CORE_ROLE_NAME}`, "
+            f"`{TRUSTED_ROLE_NAME}`, or `{RELIABLE_ROLE_NAME}`):"
         )
         for group in round_info["holding_groups"]:
             lines.append(
@@ -3170,6 +3284,7 @@ async def run_sdg_shuffle_session(guild_id: int) -> None:
                 )
                 return
 
+            refresh_sdg_target_voice_channels(session, guild)
             present_members, present_member_ids_by_channel = collect_sdg_present_members(
                 session,
                 guild,
@@ -3565,14 +3680,13 @@ async def sdg_shuffle(ctx: commands.Context):
         return
 
     target_channels = get_sdg_target_voice_channels(guild, anchor_channel)
-    max_concurrent_groups = max(1, len(participants) // 2)
-    if len(target_channels) < max_concurrent_groups:
+    minimum_required_rooms = (len(participants) + 2) // 3
+    if len(target_channels) < minimum_required_rooms:
         await ctx.send(
             f"I found only {len(target_channels)} usable voice room(s) in this category, "
-            f"but up to {max_concurrent_groups} are needed for {len(participants)} participants.",
+            f"but at least {minimum_required_rooms} are needed for {len(participants)} participants.",
         )
         return
-    target_channels = target_channels[:max_concurrent_groups]
 
     blocked_channels = [
         channel.mention
@@ -3602,11 +3716,8 @@ async def sdg_shuffle(ctx: commands.Context):
         "target_voice_channel_ids": [channel.id for channel in target_channels],
         "participant_ids": {member.id for member in participants},
         "paused_member_ids": set(),
-        "reserved_voice_numbers": set(),
-        "fresh_newcomer_round_counts": {},
-        "fresh_newcomer_core_round_counts": {},
+        "fresh_newcomer_partner_history": {},
         "round_number": 1,
-        "last_round": None,
         "next_round_at": None,
         "message": None,
         "task": None,
@@ -3624,11 +3735,12 @@ async def sdg_shuffle(ctx: commands.Context):
     confirmation = (
         f"SDG shuffle started from `{anchor_channel.name}`. "
         f"Managed rooms: {room_mentions}. "
-        f"Pairs are preferred before trios. "
+        f"Pairs are preferred before trios, and the bot tries to keep trios to the minimum needed. "
         f"Role `{SDG_CORE_ROLE_NAME}` has top newcomer priority, then `{TRUSTED_ROLE_NAME}`, then "
         f"`{RELIABLE_ROLE_NAME}`. Members with role `{SDG_NEWCOMER_ROLE_NAME}` who have been here "
-        f"{SDG_NEWCOMER_DAYS_THRESHOLD} days or less hold mentor groups for 10 minutes, and the bot aims to give them "
-        f"`{SDG_CORE_ROLE_NAME}` in about half of their round slots; the rest reshuffle every 5 minutes."
+        f"{SDG_NEWCOMER_DAYS_THRESHOLD} days or less stay for 10 minutes only when they are paired "
+        f"with one of those higher roles; all other groups reshuffle every 5 minutes. "
+        f"The bot also tries to introduce fresh newcomers to different higher-role people before repeating them."
     )
     if replaced_existing:
         confirmation += " Previous SDG shuffle session was replaced."
