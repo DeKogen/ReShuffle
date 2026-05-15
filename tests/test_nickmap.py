@@ -1,0 +1,237 @@
+import atexit
+import json
+import os
+import shutil
+import sys
+import tempfile
+import types
+import unittest
+
+
+_IMPORT_DATA_DIR = tempfile.mkdtemp(prefix="reshuffle-test-data-")
+os.environ["RESHUFFLE_DATA_DIR"] = _IMPORT_DATA_DIR
+atexit.register(lambda: shutil.rmtree(_IMPORT_DATA_DIR, ignore_errors=True))
+
+
+def _identity_decorator(*_args, **_kwargs):
+    if len(_args) == 1 and callable(_args[0]) and not _kwargs:
+        return _args[0]
+
+    def decorator(func):
+        return func
+
+    return decorator
+
+
+def _install_discord_stub_if_needed():
+    try:
+        import discord  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    class _Dummy:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __getattr__(self, _name):
+            return _Dummy()
+
+        def __call__(self, *args, **kwargs):
+            return _Dummy()
+
+    class _DummyType:
+        def __init_subclass__(cls, **kwargs):
+            super().__init_subclass__()
+
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _DummyIntents:
+        @classmethod
+        def default(cls):
+            return cls()
+
+    class _DummyTree:
+        command = staticmethod(_identity_decorator)
+        error = staticmethod(_identity_decorator)
+
+        def clear_commands(self, *args, **kwargs):
+            pass
+
+        def copy_global_to(self, *args, **kwargs):
+            pass
+
+        async def sync(self, *args, **kwargs):
+            return []
+
+        def get_commands(self, *args, **kwargs):
+            return []
+
+        def add_command(self, *args, **kwargs):
+            pass
+
+    class _DummyGroup:
+        command = staticmethod(_identity_decorator)
+
+        def __call__(self, *args, **kwargs):
+            return None
+
+    class _DummyBot:
+        def __init__(self, *args, **kwargs):
+            self.tree = _DummyTree()
+            self.guilds = []
+            self.user = None
+
+        event = staticmethod(lambda func: func)
+        command = staticmethod(_identity_decorator)
+        hybrid_command = staticmethod(_identity_decorator)
+
+        @staticmethod
+        def hybrid_group(*args, **kwargs):
+            def decorator(_func):
+                return _DummyGroup()
+
+            return decorator
+
+        def get_channel(self, *args, **kwargs):
+            return None
+
+        async def fetch_channel(self, *args, **kwargs):
+            return None
+
+        def run(self, *args, **kwargs):
+            pass
+
+        async def process_commands(self, *args, **kwargs):
+            pass
+
+        def get_guild(self, *args, **kwargs):
+            return None
+
+    discord_stub = types.ModuleType("discord")
+    discord_stub.Intents = _DummyIntents
+    discord_stub.Member = type("Member", (), {})
+    discord_stub.Guild = type("Guild", (), {})
+    discord_stub.VoiceChannel = type("VoiceChannel", (), {})
+    discord_stub.StageChannel = type("StageChannel", (), {})
+    discord_stub.TextChannel = type("TextChannel", (), {})
+    discord_stub.ScheduledEvent = type("ScheduledEvent", (), {})
+    discord_stub.Message = type("Message", (), {})
+    discord_stub.Interaction = type("Interaction", (), {})
+    discord_stub.Object = _DummyType
+    discord_stub.File = _DummyType
+    discord_stub.Forbidden = type("Forbidden", (Exception,), {})
+    discord_stub.NotFound = type("NotFound", (Exception,), {})
+    discord_stub.HTTPException = type("HTTPException", (Exception,), {})
+    discord_stub.MessageType = types.SimpleNamespace(thread_created=object())
+    discord_stub.EntityType = types.SimpleNamespace(voice=object())
+    discord_stub.EventStatus = types.SimpleNamespace(
+        active=object(),
+        completed=object(),
+        scheduled=object(),
+    )
+    discord_stub.PrivacyLevel = types.SimpleNamespace(guild_only=object())
+    discord_stub.AllowedMentions = types.SimpleNamespace(none=lambda: None)
+    discord_stub.utils = types.SimpleNamespace(
+        escape_markdown=lambda value: value,
+        sleep_until=lambda *_args, **_kwargs: None,
+    )
+    discord_stub.abc = types.SimpleNamespace(
+        GuildChannel=type("GuildChannel", (), {}),
+        Messageable=type("Messageable", (), {}),
+    )
+    discord_stub.ui = types.SimpleNamespace(
+        Modal=_DummyType,
+        TextInput=_DummyType,
+    )
+    discord_stub.app_commands = types.SimpleNamespace(
+        describe=_identity_decorator,
+        AppCommandError=type("AppCommandError", (Exception,), {}),
+    )
+
+    commands_stub = types.ModuleType("discord.ext.commands")
+    commands_stub.Bot = _DummyBot
+    commands_stub.Context = type("Context", (), {})
+    commands_stub.CommandError = type("CommandError", (Exception,), {})
+    commands_stub.CommandNotFound = type("CommandNotFound", (commands_stub.CommandError,), {})
+
+    ext_stub = types.ModuleType("discord.ext")
+    ext_stub.commands = commands_stub
+
+    sys.modules["discord"] = discord_stub
+    sys.modules["discord.ext"] = ext_stub
+    sys.modules["discord.ext.commands"] = commands_stub
+
+
+_install_discord_stub_if_needed()
+
+import Shuffle  # noqa: E402
+
+
+class NickmapPersistenceTests(unittest.TestCase):
+    def test_save_and_load_nickmap_file_normalizes_records(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "nickmap.json")
+            saved = Shuffle.save_nickmap_file(
+                {
+                    "mappings": {
+                        "u:bob": {"dc_name": "Bob"},
+                        "id:123": "Alice",
+                    }
+                },
+                path,
+            )
+
+            self.assertEqual(list(saved["mappings"].keys()), ["id:123", "u:bob"])
+            self.assertEqual(saved["mappings"]["id:123"], {"dc_name": "Alice"})
+
+            loaded = Shuffle.load_nickmap_file(path)
+            self.assertEqual(loaded, saved)
+
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            self.assertEqual(raw, saved)
+            self.assertFalse(
+                any(name.endswith(".tmp") for name in os.listdir(tmp_dir)),
+                "atomic temp files should not be left behind",
+            )
+
+    def test_atomic_write_text_replaces_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "nickmap.tengo")
+
+            Shuffle.atomic_write_text(path, "first\n")
+            Shuffle.atomic_write_text(path, "second\n")
+
+            with open(path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "second\n")
+            self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(tmp_dir)))
+
+    def test_generate_nickmap_tengo_is_stable_and_guarded(self):
+        first = Shuffle.generate_nickmap_tengo(
+            {
+                "mappings": {
+                    "u:zeta": {"dc_name": "Zed"},
+                    "id:123": {"dc_name": 'Alice "A"'},
+                }
+            }
+        )
+        second = Shuffle.generate_nickmap_tengo(
+            {
+                "mappings": {
+                    "id:123": {"dc_name": 'Alice "A"'},
+                    "u:zeta": {"dc_name": "Zed"},
+                }
+            }
+        )
+
+        self.assertEqual(first, second)
+        self.assertIn('if msgAccount == "telegram.mytelegram" {', first)
+        self.assertLess(first.index('"id:123"'), first.index('"u:zeta"'))
+        self.assertIn('"id:123": "Alice \\"A\\""', first)
+        self.assertIn('msgUsername = mapped', first)
+
+
+if __name__ == "__main__":
+    unittest.main()

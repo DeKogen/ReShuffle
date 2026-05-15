@@ -2,14 +2,16 @@ import discord
 from discord.ext import commands
 import random
 import asyncio
+import io
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 import os
 import re
+import tempfile
 import traceback
 from itertools import combinations
-from typing import Optional
+from typing import Any, Optional
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -78,12 +80,55 @@ def resolve_data_dir() -> str:
     return fallback_dir
 
 
+def resolve_runtime_path(configured_path: Optional[str], default_path: str) -> str:
+    """Resolve a configurable runtime file path."""
+    selected_path = configured_path.strip() if configured_path else default_path
+    return os.path.abspath(os.path.expanduser(selected_path))
+
+
+def parse_env_int_set(raw_value: Optional[str], *, var_name: str) -> set[int]:
+    """Parse a comma-separated environment variable into integer IDs."""
+    if not raw_value:
+        return set()
+
+    parsed: set[int] = set()
+    for raw_item in raw_value.split(","):
+        item = raw_item.strip()
+        if not item:
+            continue
+        try:
+            parsed.add(int(item))
+        except ValueError:
+            print(f"Ignoring invalid numeric ID in {var_name}: {item!r}")
+    return parsed
+
+
 DATA_DIR = resolve_data_dir()
 EVENT_TARGETS_FILE = os.path.join(DATA_DIR, "event_text_channel_targets.json")
 PERSISTENT_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "persistent_shuffle_exclusions.json")
 SHUFFLE_SETTINGS_FILE = os.path.join(DATA_DIR, "shuffle_settings.json")
 SHUFFLE_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_admin_audit.jsonl")
 VOICE_STATS_DB_FILE = os.path.join(DATA_DIR, "voice_activity.sqlite3")
+NICKMAP_JSON_PATH = resolve_runtime_path(
+    os.getenv("NICKMAP_JSON_PATH"),
+    os.path.join(DATA_DIR, "nickmap.json"),
+)
+NICKMAP_TENGO_PATH = resolve_runtime_path(
+    os.getenv("NICKMAP_TENGO_PATH"),
+    os.path.join(DATA_DIR, "nickmap.tengo"),
+)
+AUDIT_LOG_PATH = resolve_runtime_path(
+    os.getenv("AUDIT_LOG_PATH"),
+    os.path.join(DATA_DIR, "nickmap_audit.jsonl"),
+)
+NICKMAP_TELEGRAM_ACCOUNT = os.getenv("NICKMAP_TELEGRAM_ACCOUNT", "telegram.mytelegram")
+ALLOWED_ROLE_IDS = parse_env_int_set(os.getenv("ALLOWED_ROLE_IDS"), var_name="ALLOWED_ROLE_IDS")
+_audit_channel_id_env = os.getenv("AUDIT_CHANNEL_ID")
+try:
+    AUDIT_CHANNEL_ID = int(_audit_channel_id_env) if _audit_channel_id_env else None
+except ValueError:
+    print(f"Ignoring invalid AUDIT_CHANNEL_ID: {_audit_channel_id_env!r}")
+    AUDIT_CHANNEL_ID = None
 
 
 def utc_now() -> datetime:
@@ -1036,6 +1081,499 @@ def append_shuffle_audit_log(
     print(f"Shuffle audit: {json.dumps(record, ensure_ascii=False)}")
 
 
+# -------- Telegram -> Discord nick mappings --------
+
+NICKMAP_SCHEMA_VERSION = 1
+NICKMAP_LIST_PAGE_SIZE = 15
+SENSITIVE_TEXT_PATTERNS = (
+    (
+        re.compile(r"mfa\.[A-Za-z0-9_-]{20,}"),
+        "mfa.[redacted]",
+    ),
+    (
+        re.compile(r"[A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}"),
+        "[redacted-token]",
+    ),
+    (
+        re.compile(r"(?i)\b(token|secret|password|passwd|api[_-]?key)\s*[:=]\s*[^,\s]+"),
+        r"\1=[redacted]",
+    ),
+)
+
+
+class FileLock:
+    """Small cross-platform advisory lock around a sidecar lock file."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._fh = None
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self._fh = open(self.path, "a+b")
+        self._fh.seek(0, os.SEEK_END)
+        if self._fh.tell() == 0:
+            self._fh.write(b"\0")
+            self._fh.flush()
+
+        self._fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._fh is None:
+            return
+        try:
+            self._fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(self._fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._fh.close()
+            self._fh = None
+
+
+def fsync_directory(path: str) -> None:
+    """Best-effort fsync for a directory after an atomic rename."""
+    if os.name == "nt":
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        dir_fd = os.open(path, flags)
+    except OSError:
+        return
+
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def atomic_write_text(path: str, content: str) -> None:
+    """Atomically replace a UTF-8 text file with fsync before rename."""
+    target_path = os.path.abspath(path)
+    target_dir = os.path.dirname(target_path)
+    os.makedirs(target_dir, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target_path)}.",
+        suffix=".tmp",
+        dir=target_dir,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(content)
+            fh.flush()
+            os.fsync(fh.fileno())
+
+        os.replace(temp_path, target_path)
+        fsync_directory(target_dir)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def atomic_write_json(path: str, data: Any) -> None:
+    """Atomically write deterministic JSON."""
+    content = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    atomic_write_text(path, content)
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Redact token-looking strings before writing audit records."""
+    redacted = value
+    for pattern, replacement in SENSITIVE_TEXT_PATTERNS:
+        redacted = pattern.sub(replacement, redacted)
+    return redacted
+
+
+def redact_sensitive_data(value: Any) -> Any:
+    """Recursively redact secret-looking strings in audit payloads."""
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [redact_sensitive_data(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            redact_sensitive_text(str(key)): redact_sensitive_data(item)
+            for key, item in value.items()
+        }
+    return value
+
+
+def normalize_nickmap_key(raw_key: Any) -> str:
+    """Normalize and validate a Telegram identity key."""
+    key = str(raw_key).strip()
+    if not key:
+        raise ValueError("tg_key cannot be empty.")
+    if any(char in key for char in ("\r", "\n", "\0")):
+        raise ValueError("tg_key cannot contain control characters.")
+    return key
+
+
+def normalize_dc_name(raw_name: Any) -> str:
+    """Normalize and validate a Discord display name value."""
+    name = str(raw_name).strip()
+    if not name:
+        raise ValueError("dc_name cannot be empty.")
+    if any(char in name for char in ("\r", "\n", "\0")):
+        raise ValueError("dc_name cannot contain control characters.")
+    return name
+
+
+def optional_str(value: Any) -> Optional[str]:
+    """Return a stripped string or None."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
+def normalize_nickmap_record(raw_record: Any) -> dict[str, Any]:
+    """Normalize one stored mapping record."""
+    if isinstance(raw_record, str):
+        return {"dc_name": normalize_dc_name(raw_record)}
+
+    if not isinstance(raw_record, dict):
+        raise ValueError("mapping record must be an object or string.")
+
+    record: dict[str, Any] = {"dc_name": normalize_dc_name(raw_record.get("dc_name", ""))}
+    for field_name in (
+        "dc_user_id",
+        "dc_user_tag",
+        "dc_user_display_name",
+        "updated_at",
+        "updated_by_id",
+        "updated_by_tag",
+    ):
+        field_value = optional_str(raw_record.get(field_name))
+        if field_value is not None:
+            record[field_name] = field_value
+    return record
+
+
+def normalize_nickmap_data(raw_data: Any) -> dict[str, Any]:
+    """Normalize supported nickmap JSON shapes into the current schema."""
+    if not isinstance(raw_data, dict):
+        return {"version": NICKMAP_SCHEMA_VERSION, "mappings": {}}
+
+    raw_mappings = raw_data.get("mappings")
+    if not isinstance(raw_mappings, dict):
+        raw_mappings = raw_data
+
+    mappings: dict[str, dict[str, Any]] = {}
+    for raw_key, raw_record in raw_mappings.items():
+        try:
+            key = normalize_nickmap_key(raw_key)
+            record = normalize_nickmap_record(raw_record)
+        except ValueError:
+            continue
+        mappings[key] = record
+
+    return {
+        "version": NICKMAP_SCHEMA_VERSION,
+        "mappings": {key: mappings[key] for key in sorted(mappings)},
+    }
+
+
+def load_nickmap_file(path: str = NICKMAP_JSON_PATH, *, strict: bool = False) -> dict[str, Any]:
+    """Load nick mappings from disk, tolerating a missing file."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw_data = json.load(fh)
+    except FileNotFoundError:
+        return {"version": NICKMAP_SCHEMA_VERSION, "mappings": {}}
+    except Exception as e:
+        if strict:
+            raise
+        print(f"Failed to load nickmap JSON: {e}")
+        return {"version": NICKMAP_SCHEMA_VERSION, "mappings": {}}
+
+    return normalize_nickmap_data(raw_data)
+
+
+def save_nickmap_file(data: dict[str, Any], path: str = NICKMAP_JSON_PATH) -> dict[str, Any]:
+    """Normalize and atomically persist the nickmap JSON."""
+    normalized = normalize_nickmap_data(data)
+    atomic_write_json(path, normalized)
+    return normalized
+
+
+def tengo_string(value: str) -> str:
+    """Render a Python string as a Tengo string literal."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def get_nickmap_mappings(data: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Return normalized mapping records keyed by tg_key."""
+    return normalize_nickmap_data(data)["mappings"]
+
+
+def generate_nickmap_tengo(
+    data: dict[str, Any],
+    *,
+    telegram_account: str = NICKMAP_TELEGRAM_ACCOUNT,
+) -> str:
+    """Generate deterministic Matterbridge InMessage Tengo code."""
+    mappings = get_nickmap_mappings(data)
+
+    lines = [
+        "# Generated by ReShuffle. Do not edit by hand.",
+        "# Source: nickmap.json",
+        "nickmap := {",
+    ]
+    for index, key in enumerate(sorted(mappings)):
+        comma = "," if index < len(mappings) - 1 else ""
+        lines.append(
+            f"    {tengo_string(key)}: {tengo_string(mappings[key]['dc_name'])}{comma}"
+        )
+    lines.extend(
+        [
+            "}",
+            "",
+            f"if msgAccount == {tengo_string(telegram_account)} {{",
+            '    mapped := nickmap["id:" + msgUserID]',
+            "    if mapped == undefined {",
+            '        mapped = nickmap["u:" + msgUsername]',
+            "    }",
+            "    if mapped == undefined {",
+            '        mapped = nickmap["tg:" + msgUsername]',
+            "    }",
+            "    if mapped == undefined {",
+            "        mapped = nickmap[msgUsername]",
+            "    }",
+            "    if mapped != undefined {",
+            "        msgUsername = mapped",
+            "    }",
+            "}",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def write_nickmap_tengo_file(
+    data: dict[str, Any],
+    path: str = NICKMAP_TENGO_PATH,
+) -> None:
+    """Atomically write the Matterbridge Tengo script."""
+    atomic_write_text(path, generate_nickmap_tengo(data))
+
+
+def nickmap_lock_path(path: str = NICKMAP_JSON_PATH) -> str:
+    """Return the sidecar lock path for nickmap JSON/Tengo updates."""
+    return f"{path}.lock"
+
+
+def audit_lock_path(path: str = AUDIT_LOG_PATH) -> str:
+    """Return the sidecar lock path for audit appends."""
+    return f"{path}.lock"
+
+
+def member_has_nickmap_access(member: discord.Member) -> bool:
+    """Allow configured roles or Discord administrators to use nickmap commands."""
+    if member.guild_permissions.administrator:
+        return True
+    return bool(ALLOWED_ROLE_IDS and any(role.id in ALLOWED_ROLE_IDS for role in member.roles))
+
+
+def get_nickmap_access_label() -> str:
+    """Return a readable nickmap command permission label."""
+    if not ALLOWED_ROLE_IDS:
+        return "`Administrator`"
+    role_list = ", ".join(str(role_id) for role_id in sorted(ALLOWED_ROLE_IDS))
+    return f"`Administrator` or configured role IDs: `{role_list}`"
+
+
+def build_nickmap_record(
+    *,
+    dc_name: str,
+    actor: Any,
+    dc_user: Optional[discord.Member] = None,
+) -> dict[str, Any]:
+    """Build one persisted nickmap record."""
+    record: dict[str, Any] = {
+        "dc_name": normalize_dc_name(dc_name),
+        "updated_at": utc_now().isoformat().replace("+00:00", "Z"),
+        "updated_by_id": str(actor.id),
+        "updated_by_tag": str(actor),
+    }
+
+    if dc_user is not None:
+        record["dc_user_id"] = str(dc_user.id)
+        record["dc_user_tag"] = str(dc_user)
+        record["dc_user_display_name"] = dc_user.display_name
+    return record
+
+
+def append_nickmap_audit_log(
+    *,
+    action: str,
+    actor: Any,
+    tg_key: str,
+    before: Optional[dict[str, Any]],
+    after: Optional[dict[str, Any]],
+    guild_id: Optional[int],
+    channel_id: Optional[int],
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Append one JSONL audit record for nickmap changes."""
+    record: dict[str, Any] = {
+        "timestamp": utc_now().isoformat().replace("+00:00", "Z"),
+        "actor_id": str(actor.id),
+        "actor_tag": str(actor),
+        "action": action,
+        "tg_key": tg_key,
+        "before": before,
+        "after": after,
+        "reason": optional_str(reason),
+        "guild_id": str(guild_id) if guild_id is not None else None,
+        "channel_id": str(channel_id) if channel_id is not None else None,
+    }
+    record = redact_sensitive_data(record)
+
+    os.makedirs(os.path.dirname(os.path.abspath(AUDIT_LOG_PATH)), exist_ok=True)
+    with FileLock(audit_lock_path()):
+        with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+
+    print(f"Nickmap audit: {json.dumps(record, ensure_ascii=False, sort_keys=True)}")
+    return record
+
+
+async def maybe_post_nickmap_audit_message(record: dict[str, Any]) -> None:
+    """Post a compact nickmap audit message to Discord when configured."""
+    if AUDIT_CHANNEL_ID is None:
+        return
+
+    channel = bot.get_channel(AUDIT_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(AUDIT_CHANNEL_ID)
+        except Exception as e:
+            print(f"Failed to fetch nickmap audit channel {AUDIT_CHANNEL_ID}: {e}")
+            return
+
+    if not hasattr(channel, "send"):
+        print(f"Configured AUDIT_CHANNEL_ID {AUDIT_CHANNEL_ID} is not sendable.")
+        return
+
+    before_name = (record.get("before") or {}).get("dc_name") if record.get("before") else None
+    after_name = (record.get("after") or {}).get("dc_name") if record.get("after") else None
+    reason = record.get("reason")
+    lines = [
+        f"**Nickmap {record['action']}** `{record['tg_key']}`",
+        f"Actor: `{record['actor_tag']}` (`{record['actor_id']}`)",
+        f"Before: `{before_name or '-'}` | After: `{after_name or '-'}`",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}")
+
+    try:
+        await channel.send(
+            "\n".join(lines)[:1900],
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    except Exception as e:
+        print(f"Failed to post nickmap audit message: {e}")
+
+
+def set_nickmap_entry(
+    *,
+    tg_key: str,
+    dc_name: str,
+    actor: Any,
+    dc_user: Optional[discord.Member],
+) -> tuple[Optional[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Set one mapping and regenerate the Tengo file under a file lock."""
+    key = normalize_nickmap_key(tg_key)
+    record = build_nickmap_record(dc_name=dc_name, actor=actor, dc_user=dc_user)
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(strict=True)
+        mappings = dict(data["mappings"])
+        before = mappings.get(key)
+        mappings[key] = record
+        data = save_nickmap_file({"version": NICKMAP_SCHEMA_VERSION, "mappings": mappings})
+        write_nickmap_tengo_file(data)
+    return before, record, data
+
+
+def delete_nickmap_entry(
+    *,
+    tg_key: str,
+) -> tuple[Optional[dict[str, Any]], dict[str, Any]]:
+    """Delete one mapping and regenerate the Tengo file under a file lock."""
+    key = normalize_nickmap_key(tg_key)
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(strict=True)
+        mappings = dict(data["mappings"])
+        before = mappings.pop(key, None)
+        if before is not None:
+            data = save_nickmap_file({"version": NICKMAP_SCHEMA_VERSION, "mappings": mappings})
+            write_nickmap_tengo_file(data)
+    return before, data
+
+
+def format_inline_code(value: Any) -> str:
+    """Format a short value as Discord inline code without breaking markdown."""
+    text = str(value).replace("`", "'")
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return f"`{text}`"
+
+
+def format_nickmap_record(record: dict[str, Any]) -> str:
+    """Render one mapping record for Discord output."""
+    parts = [discord.utils.escape_markdown(record["dc_name"])]
+    dc_user_id = record.get("dc_user_id")
+    if dc_user_id:
+        parts.append(f"<@{dc_user_id}>")
+    updated_at = record.get("updated_at")
+    if updated_at:
+        parts.append(f"updated {updated_at}")
+    return " | ".join(parts)
+
+
+def filter_nickmap_entries(
+    mappings: dict[str, dict[str, Any]],
+    raw_filter: Optional[str],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return sorted nickmap entries filtered by key or Discord name."""
+    filter_text = (raw_filter or "").strip().casefold()
+    entries = sorted(mappings.items())
+    if not filter_text:
+        return entries
+
+    return [
+        (key, record)
+        for key, record in entries
+        if filter_text in key.casefold()
+        or filter_text in record.get("dc_name", "").casefold()
+        or filter_text in record.get("dc_user_tag", "").casefold()
+        or filter_text in record.get("dc_user_display_name", "").casefold()
+    ]
+
+
 def is_frozen_event(event: discord.ScheduledEvent) -> bool:
     """Frozen events must not auto-post notices or run shuffles."""
     return FROZEN_EVENT_MARKER in event.name.casefold()
@@ -1821,6 +2359,20 @@ def build_shuffle_member_label(
     return f"{member.display_name} {' '.join(markers)}"
 
 
+def generate_shuffle_order(members: list[discord.Member]) -> list[int]:
+    """Generate a random order with a trusted member first when available."""
+    trusted_members = [member for member in members if has_trusted_role(member)]
+    if not trusted_members:
+        order = list(members)
+        random.shuffle(order)
+        return [member.id for member in order]
+
+    first_member = random.choice(trusted_members)
+    remaining_members = [member for member in members if member.id != first_member.id]
+    random.shuffle(remaining_members)
+    return [first_member.id] + [member.id for member in remaining_members]
+
+
 def is_shuffle_hot_joiner(state: dict, member_id: int) -> bool:
     """Return whether a member joined after this shuffle was posted."""
     if member_id in state.get("hot_joiner_member_ids", set()):
@@ -2244,8 +2796,7 @@ async def start_shuffle_for_channel(
             await text_channel.send(empty_message)
         return
 
-    order = [m.id for m in members]
-    random.shuffle(order)
+    order = generate_shuffle_order(members)
 
     labels: dict[int, str] = {}  # labels for ✨ / 🌌
 
@@ -4849,6 +5400,261 @@ async def voice_daily(
         lines.append(f"`{day_label}`: {format_duration(total_seconds)}")
 
     await send_hybrid_response(ctx, "\n".join(lines))
+
+
+# ===============================
+#   COMMANDS: Telegram nickmap
+# ===============================
+
+async def ensure_nickmap_command_access(ctx: commands.Context) -> bool:
+    """Validate guild scope and nickmap permissions for a command."""
+    if ctx.guild is None:
+        await send_hybrid_response(
+            ctx,
+            "This command can only be used inside a server.",
+            ephemeral=True,
+        )
+        return False
+
+    if not isinstance(ctx.author, discord.Member) or not member_has_nickmap_access(ctx.author):
+        await send_hybrid_response(
+            ctx,
+            f"You do not have permission to manage nick mappings. Required: {get_nickmap_access_label()}.",
+            ephemeral=True,
+        )
+        return False
+
+    return True
+
+
+@bot.hybrid_group(
+    name='map',
+    description='Manage Telegram to Discord nick mappings',
+    invoke_without_command=True,
+)
+async def nickmap_group(ctx: commands.Context):
+    await send_hybrid_response(
+        ctx,
+        "Use `/map set`, `/map del`, `/map get`, `/map list`, or `/map export`.",
+        ephemeral=True,
+    )
+
+
+@nickmap_group.command(
+    name='set',
+    description='Set a Telegram identity to Discord display-name mapping',
+)
+@discord.app_commands.describe(
+    tg_key='Telegram identity key, for example u:tg_user or id:123456789',
+    dc_name='Discord-style display name to show through Matterbridge',
+    dc_user='Optional Discord member associated with this mapping',
+    reason='Optional audit reason',
+)
+async def nickmap_set(
+    ctx: commands.Context,
+    tg_key: str,
+    dc_name: str,
+    dc_user: Optional[discord.Member] = None,
+    reason: str = "",
+):
+    await defer_hybrid_command(ctx)
+    if not await ensure_nickmap_command_access(ctx):
+        return
+
+    try:
+        key = normalize_nickmap_key(tg_key)
+        before, after, data = set_nickmap_entry(
+            tg_key=key,
+            dc_name=dc_name,
+            actor=ctx.author,
+            dc_user=dc_user,
+        )
+    except ValueError as e:
+        await finish_hybrid_command(ctx, str(e))
+        return
+
+    guild_id = ctx.guild.id if ctx.guild else None
+    channel_id = getattr(ctx.channel, "id", None)
+    audit_record = append_nickmap_audit_log(
+        action="set",
+        actor=ctx.author,
+        tg_key=key,
+        before=before,
+        after=after,
+        reason=reason,
+        guild_id=guild_id,
+        channel_id=channel_id,
+    )
+    await maybe_post_nickmap_audit_message(audit_record)
+
+    action_label = "Updated" if before else "Added"
+    await finish_hybrid_command(
+        ctx,
+        f"{action_label} {format_inline_code(key)} -> {format_inline_code(after['dc_name'])}. "
+        f"{len(data['mappings'])} mapping(s) saved; Tengo regenerated.",
+    )
+
+
+@nickmap_group.command(
+    name='del',
+    description='Delete a Telegram identity mapping',
+)
+@discord.app_commands.describe(
+    tg_key='Telegram identity key to delete',
+    reason='Optional audit reason',
+)
+async def nickmap_del(
+    ctx: commands.Context,
+    tg_key: str,
+    reason: str = "",
+):
+    await defer_hybrid_command(ctx)
+    if not await ensure_nickmap_command_access(ctx):
+        return
+
+    try:
+        key = normalize_nickmap_key(tg_key)
+        before, data = delete_nickmap_entry(tg_key=key)
+    except ValueError as e:
+        await finish_hybrid_command(ctx, str(e))
+        return
+
+    if before is None:
+        await finish_hybrid_command(ctx, f"No mapping found for {format_inline_code(key)}.")
+        return
+
+    guild_id = ctx.guild.id if ctx.guild else None
+    channel_id = getattr(ctx.channel, "id", None)
+    audit_record = append_nickmap_audit_log(
+        action="del",
+        actor=ctx.author,
+        tg_key=key,
+        before=before,
+        after=None,
+        reason=reason,
+        guild_id=guild_id,
+        channel_id=channel_id,
+    )
+    await maybe_post_nickmap_audit_message(audit_record)
+
+    await finish_hybrid_command(
+        ctx,
+        f"Deleted {format_inline_code(key)}. "
+        f"{len(data['mappings'])} mapping(s) remain; Tengo regenerated.",
+    )
+
+
+@nickmap_group.command(
+    name='get',
+    description='Show one Telegram identity mapping',
+)
+@discord.app_commands.describe(
+    tg_key='Telegram identity key to look up',
+)
+async def nickmap_get(ctx: commands.Context, tg_key: str):
+    await defer_hybrid_command(ctx)
+    if not await ensure_nickmap_command_access(ctx):
+        return
+
+    try:
+        key = normalize_nickmap_key(tg_key)
+    except ValueError as e:
+        await finish_hybrid_command(ctx, str(e))
+        return
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(strict=True)
+    record = data["mappings"].get(key)
+    if record is None:
+        await finish_hybrid_command(ctx, f"No mapping found for {format_inline_code(key)}.")
+        return
+
+    await send_hybrid_response(
+        ctx,
+        f"{format_inline_code(key)} -> {format_nickmap_record(record)}",
+        ephemeral=True,
+    )
+
+
+@nickmap_group.command(
+    name='list',
+    description='List Telegram to Discord nick mappings',
+)
+@discord.app_commands.describe(
+    filter='Optional text filter for Telegram key or Discord name',
+    page='Page number',
+)
+async def nickmap_list(
+    ctx: commands.Context,
+    filter: str = "",
+    page: int = 1,
+):
+    await defer_hybrid_command(ctx)
+    if not await ensure_nickmap_command_access(ctx):
+        return
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(strict=True)
+    entries = filter_nickmap_entries(data["mappings"], filter)
+    if not entries:
+        await finish_hybrid_command(ctx, "No nick mappings found.")
+        return
+
+    total_pages = max(1, (len(entries) + NICKMAP_LIST_PAGE_SIZE - 1) // NICKMAP_LIST_PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    start_index = (page - 1) * NICKMAP_LIST_PAGE_SIZE
+    page_entries = entries[start_index:start_index + NICKMAP_LIST_PAGE_SIZE]
+
+    header = f"**Nick mappings** page {page}/{total_pages} ({len(entries)} entr"
+    header += "y" if len(entries) == 1 else "ies"
+    header += ")"
+    if filter.strip():
+        header += f" filtered by {format_inline_code(filter.strip())}"
+
+    lines = [header]
+    for offset, (key, record) in enumerate(page_entries, start=start_index + 1):
+        lines.append(f"{offset}. {format_inline_code(key)} -> {format_nickmap_record(record)}")
+
+    await send_hybrid_response(ctx, "\n".join(lines), ephemeral=True)
+
+
+@nickmap_group.command(
+    name='export',
+    description='Export nick mappings as JSON',
+)
+async def nickmap_export(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+    if not await ensure_nickmap_command_access(ctx):
+        return
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(strict=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    export_file = discord.File(
+        io.BytesIO(payload.encode("utf-8")),
+        filename="nickmap.json",
+    )
+
+    if ctx.interaction is None:
+        await ctx.send(
+            f"Exported {len(data['mappings'])} mapping(s).",
+            file=export_file,
+        )
+        return
+
+    if ctx.interaction.response.is_done():
+        await ctx.interaction.followup.send(
+            f"Exported {len(data['mappings'])} mapping(s).",
+            file=export_file,
+            ephemeral=True,
+        )
+        return
+
+    await ctx.interaction.response.send_message(
+        f"Exported {len(data['mappings'])} mapping(s).",
+        file=export_file,
+        ephemeral=True,
+    )
 
 
 # ===============================
