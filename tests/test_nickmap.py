@@ -208,6 +208,36 @@ class NickmapPersistenceTests(unittest.TestCase):
                 self.assertEqual(fh.read(), "second\n")
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(tmp_dir)))
 
+    def test_persistent_shuffle_exclusions_are_saved_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original_path = Shuffle.PERSISTENT_EXCLUSIONS_FILE
+            original_exclusions = {
+                guild_id: set(user_ids)
+                for guild_id, user_ids in Shuffle.persistent_shuffle_exclusions.items()
+            }
+            Shuffle.PERSISTENT_EXCLUSIONS_FILE = os.path.join(
+                tmp_dir,
+                "persistent_shuffle_exclusions.json",
+            )
+            try:
+                Shuffle.persistent_shuffle_exclusions.clear()
+                Shuffle.persistent_shuffle_exclusions[100] = {3, 1, 2}
+
+                Shuffle.save_persistent_shuffle_exclusions()
+
+                self.assertEqual(
+                    Shuffle.load_persistent_shuffle_exclusions(),
+                    {100: {1, 2, 3}},
+                )
+                self.assertFalse(
+                    any(name.endswith(".tmp") for name in os.listdir(tmp_dir)),
+                    "atomic temp files should not be left behind",
+                )
+            finally:
+                Shuffle.PERSISTENT_EXCLUSIONS_FILE = original_path
+                Shuffle.persistent_shuffle_exclusions.clear()
+                Shuffle.persistent_shuffle_exclusions.update(original_exclusions)
+
     def test_generate_nickmap_tengo_is_stable_and_guarded(self):
         first = Shuffle.generate_nickmap_tengo(
             {
@@ -231,6 +261,16 @@ class NickmapPersistenceTests(unittest.TestCase):
         self.assertLess(first.index('"id:123"'), first.index('"u:zeta"'))
         self.assertIn('"id:123": "Alice \\"A\\""', first)
         self.assertIn('msgUsername = mapped', first)
+
+    def test_trusted_role_default_id_can_manage_nickmap(self):
+        member = types.SimpleNamespace(
+            guild_permissions=types.SimpleNamespace(administrator=False),
+            roles=[types.SimpleNamespace(id=1434300421647761489, name="anything")],
+        )
+
+        self.assertEqual(Shuffle.TRUSTED_ROLE_ID, 1434300421647761489)
+        self.assertTrue(Shuffle.has_trusted_role(member))
+        self.assertTrue(Shuffle.member_has_nickmap_access(member))
 
 
 if __name__ == "__main__":

@@ -762,9 +762,10 @@ async def clear_remote_global_commands_preserving_local_tree() -> int:
 RELIABLE_ROLE_NAME = "Товарищ"
 _reliable_role_id_env = os.getenv("RELIABLE_ROLE_ID")
 RELIABLE_ROLE_ID = int(_reliable_role_id_env) if _reliable_role_id_env else None
-TRUSTED_ROLE_NAME = "надежный"
+TRUSTED_ROLE_NAME = "Надежный"
+DEFAULT_TRUSTED_ROLE_ID = 1434300421647761489
 _trusted_role_id_env = os.getenv("TRUSTED_ROLE_ID")
-TRUSTED_ROLE_ID = int(_trusted_role_id_env) if _trusted_role_id_env else None
+TRUSTED_ROLE_ID = int(_trusted_role_id_env) if _trusted_role_id_env else DEFAULT_TRUSTED_ROLE_ID
 USER_MENTION_PATTERN = re.compile(r"<@!?(\d+)>")
 USER_ID_PATTERN = re.compile(r"\b(\d{15,20})\b")
 
@@ -886,12 +887,13 @@ def resolve_excluded_members(
 def load_persistent_shuffle_exclusions() -> dict[int, set[int]]:
     """Load guild-level persistent shuffle exclusions from disk."""
     try:
-        with open(PERSISTENT_EXCLUSIONS_FILE, "r", encoding="utf-8") as fh:
-            raw = json.load(fh)
+        with FileLock(persistent_exclusions_lock_path()):
+            with open(PERSISTENT_EXCLUSIONS_FILE, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
     except FileNotFoundError:
         return {}
     except Exception as e:
-        print(f"Failed to load persistent shuffle exclusions: {e}")
+        print(f"Failed to load persistent shuffle exclusions from {PERSISTENT_EXCLUSIONS_FILE}: {e}")
         return {}
 
     if not isinstance(raw, dict):
@@ -929,10 +931,11 @@ def save_persistent_shuffle_exclusions() -> None:
     }
 
     try:
-        with open(PERSISTENT_EXCLUSIONS_FILE, "w", encoding="utf-8") as fh:
-            json.dump(serializable, fh, indent=2, sort_keys=True)
+        with FileLock(persistent_exclusions_lock_path()):
+            atomic_write_json(PERSISTENT_EXCLUSIONS_FILE, serializable)
     except Exception as e:
-        print(f"Failed to save persistent shuffle exclusions: {e}")
+        print(f"Failed to save persistent shuffle exclusions to {PERSISTENT_EXCLUSIONS_FILE}: {e}")
+        raise
 
 
 def get_persistent_excluded_member_ids(guild_id: int) -> set[int]:
@@ -1376,19 +1379,26 @@ def write_nickmap_tengo_file(
     atomic_write_text(path, generate_nickmap_tengo(data))
 
 
-def nickmap_lock_path(path: str = NICKMAP_JSON_PATH) -> str:
+def nickmap_lock_path(path: Optional[str] = None) -> str:
     """Return the sidecar lock path for nickmap JSON/Tengo updates."""
-    return f"{path}.lock"
+    return f"{path or NICKMAP_JSON_PATH}.lock"
 
 
-def audit_lock_path(path: str = AUDIT_LOG_PATH) -> str:
+def persistent_exclusions_lock_path(path: Optional[str] = None) -> str:
+    """Return the sidecar lock path for persistent shuffle exclusions."""
+    return f"{path or PERSISTENT_EXCLUSIONS_FILE}.lock"
+
+
+def audit_lock_path(path: Optional[str] = None) -> str:
     """Return the sidecar lock path for audit appends."""
-    return f"{path}.lock"
+    return f"{path or AUDIT_LOG_PATH}.lock"
 
 
 def member_has_nickmap_access(member: discord.Member) -> bool:
-    """Allow configured roles or Discord administrators to use nickmap commands."""
+    """Allow configured/trusted roles or Discord administrators to use nickmap commands."""
     if member.guild_permissions.administrator:
+        return True
+    if has_trusted_role(member):
         return True
     return bool(ALLOWED_ROLE_IDS and any(role.id in ALLOWED_ROLE_IDS for role in member.roles))
 
@@ -1396,9 +1406,9 @@ def member_has_nickmap_access(member: discord.Member) -> bool:
 def get_nickmap_access_label() -> str:
     """Return a readable nickmap command permission label."""
     if not ALLOWED_ROLE_IDS:
-        return "`Administrator`"
+        return f"`Administrator` or `{TRUSTED_ROLE_NAME}`"
     role_list = ", ".join(str(role_id) for role_id in sorted(ALLOWED_ROLE_IDS))
-    return f"`Administrator` or configured role IDs: `{role_list}`"
+    return f"`Administrator`, `{TRUSTED_ROLE_NAME}`, or configured role IDs: `{role_list}`"
 
 
 def build_nickmap_record(
@@ -1756,6 +1766,11 @@ init_voice_tracking_db()
 async def on_ready():
     print(f'{bot.user} connected. Guilds: {len(bot.guilds)}')
     print(f"Runtime data dir: {DATA_DIR}")
+    print(
+        f"Persistent shuffle exclusions: {PERSISTENT_EXCLUSIONS_FILE} "
+        f"({sum(len(user_ids) for user_ids in persistent_shuffle_exclusions.values())} user(s) "
+        f"across {len(persistent_shuffle_exclusions)} guild(s))"
+    )
     if USE_GUILD_ONLY_APP_COMMANDS:
         try:
             cleared_count = await clear_remote_global_commands_preserving_local_tree()
