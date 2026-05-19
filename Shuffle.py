@@ -41,7 +41,6 @@ planned_event_messages: dict[tuple[int, int], tuple[int, int]] = {}
 event_text_channel_targets: dict[str, int] = {}
 persistent_shuffle_exclusions: dict[int, set[int]] = {}
 shuffle_settings: dict[int, dict[str, bool]] = {}
-PROCESS_STARTED_AT = datetime.now(timezone.utc)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
@@ -49,7 +48,6 @@ REMOVE_DELAY = 30  # seconds after leaving the voice channel
 CAMERA_GRACE_SECONDS = 30  # seconds to allow camera-off state before disconnecting
 SHUFFLE_TRACKING_WINDOW = 600  # seconds to keep accepting join/leave updates
 SDG_ROUND_SECONDS = 300  # 5 minutes
-STARTUP_CLOCK_SKEW = timedelta(seconds=5)
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
 FROZEN_EVENT_MARKER = "[замороженно]"
@@ -1854,10 +1852,9 @@ async def on_ready():
                 if not isinstance(voice_channel, discord.VoiceChannel):
                     continue
 
-                text_channel = await pick_saved_or_linked_text_channel(
+                text_channel = await pick_saved_event_text_channel(
                     guild,
                     ev.id,
-                    voice_channel,
                     ev.start_time,
                 )
                 if text_channel is None:
@@ -1936,14 +1933,6 @@ async def on_guild_scheduled_event_update(before, after):
         return
 
     if after.status is discord.EventStatus.active and before.status is not discord.EventStatus.active:
-        if (
-            after.start_time is not None
-            and after.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
-        ):
-            start_ts = int(after.start_time.timestamp())
-            triggered_event_occurrences.add((after.id, start_ts))
-            print(f"Ignoring scheduled event update for already-started event {after.id}")
-            return
         await trigger_shuffle_for_event(after)
 
     if (
@@ -1953,10 +1942,9 @@ async def on_guild_scheduled_event_update(before, after):
     ):
         voice_channel = after.guild.get_channel(after.channel_id) if after.channel_id else None
         if isinstance(voice_channel, discord.VoiceChannel):
-            text_channel = await pick_saved_or_linked_text_channel(
+            text_channel = await pick_saved_event_text_channel(
                 after.guild,
                 after.id,
-                voice_channel,
                 after.start_time,
             )
             if text_channel is not None:
@@ -2012,13 +2000,12 @@ def pick_text_channel_for_voice(
     return None
 
 
-async def pick_saved_or_linked_text_channel(
+async def pick_saved_event_text_channel(
     guild: discord.Guild,
     event_id: int,
-    voice_channel: discord.VoiceChannel,
     start_time: Optional[datetime],
 ) -> Optional[discord.abc.Messageable]:
-    """Prefer the saved event target channel, then fall back to voice-linked lookup."""
+    """Resolve the explicitly saved text target for one event occurrence."""
     target_keys = [make_event_target_key(event_id, start_time), str(event_id)]
     for target_key in target_keys:
         saved_channel_id = event_text_channel_targets.get(target_key)
@@ -2040,13 +2027,8 @@ async def pick_saved_or_linked_text_channel(
         event_text_channel_targets.pop(target_key, None)
         save_event_text_channel_targets()
 
-    fallback_channel = pick_text_channel_for_voice(voice_channel)
-    if fallback_channel is not None:
-        print(
-            f"No saved shuffle target for event {event_id}; "
-            f"falling back to linked text channel {fallback_channel.id}"
-        )
-    return fallback_channel
+    print(f"No saved shuffle target for event {event_id}; skipping auto-shuffle")
+    return None
 
 
 def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple[int, int]:
@@ -2228,7 +2210,6 @@ def schedule_event_lifecycle(
             try:
                 await trigger_shuffle_for_event(
                     ev or discord.Object(id=event_id),
-                    allow_stale_active=True,
                     preferred_text_channel=text_channel,
                     preferred_message=planned_message,
                 )
@@ -2268,7 +2249,6 @@ def schedule_event_lifecycle(
 async def trigger_shuffle_for_event(
     event: discord.ScheduledEvent,
     *,
-    allow_stale_active: bool = False,
     preferred_text_channel=None,
     preferred_message: Optional[discord.Message] = None,
 ) -> None:
@@ -2291,20 +2271,6 @@ async def trigger_shuffle_for_event(
     triggering_event_occurrences.add(key)
 
     try:
-        # On reconnect/restart, Discord may surface an already-active event again.
-        # If this occurrence started before the current process came up, do not
-        # replay its shuffle.
-        if (
-            not allow_stale_active
-            and
-            event.status is discord.EventStatus.active
-            and event.start_time is not None
-            and event.start_time <= (PROCESS_STARTED_AT + STARTUP_CLOCK_SKEW)
-        ):
-            triggered_event_occurrences.add(key)
-            print(f"Skipping stale active event {event.id} on startup/reconnect")
-            return
-
         guild = event.guild
         voice_channel = guild.get_channel(event.channel_id)
         if not isinstance(voice_channel, discord.VoiceChannel):
@@ -2313,10 +2279,9 @@ async def trigger_shuffle_for_event(
 
         text_channel = preferred_text_channel
         if text_channel is None:
-            text_channel = await pick_saved_or_linked_text_channel(
+            text_channel = await pick_saved_event_text_channel(
                 guild,
                 event.id,
-                voice_channel,
                 event.start_time,
             )
         if text_channel is None:
@@ -4117,7 +4082,7 @@ async def create_scheduled_shuffle_event(
     duration_minutes: int,
     name: str
 ) -> None:
-    """Create a scheduled event and set up auto-start shuffle and auto-complete."""
+    """Create a scheduled event and set up auto-start shuffled list and auto-complete."""
     start_time = datetime.now(timezone.utc) + timedelta(minutes=start_in_minutes)
     end_time = start_time + timedelta(minutes=duration_minutes)
 
@@ -4155,7 +4120,7 @@ async def create_scheduled_shuffle_event(
         f"Starts: <t:{start_ts}:F>\n"
         f"Ends:   <t:{end_ts}:F>\n"
         f"Voice channel: {voice_channel.mention}\n"
-        f"Shuffle will auto-run here: {shuffle_target_name}"
+        f"Shuffled list will auto-run here: {shuffle_target_name}"
     )
 
     guild_id = guild.id
@@ -4989,7 +4954,7 @@ async def shuffle_camera_status(ctx: commands.Context):
 
 @bot.hybrid_command(
     name='schedule_event',
-    description='Schedule a voice event that auto-starts shuffle and auto-ends'
+    description='Schedule a voice event that auto-posts a shuffled list and auto-ends'
 )
 async def schedule_event(
     ctx: commands.Context,
@@ -5126,10 +5091,10 @@ async def schedule_event_menu(interaction: discord.Interaction):
 
 @bot.hybrid_command(
     name='attach_event',
-    description='Attach shuffle auto-start/auto-end to an existing scheduled voice event'
+    description='Attach shuffled-list auto-start/auto-end to an existing scheduled voice event'
 )
 async def attach_event(ctx: commands.Context, event_id: str):
-    """Attach auto-shuffle to an already existing (possibly recurring) voice event."""
+    """Attach auto-shuffle list handling to an existing voice event."""
     await defer_hybrid_command(ctx)
 
     user = ctx.author
@@ -5205,7 +5170,7 @@ async def attach_event(ctx: commands.Context, event_id: str):
         f"Status: `{event.status.name}`\n"
         f"Starts: <t:{int(start_time.timestamp())}:F>\n"
         f"Ends:   <t:{int(end_time.timestamp())}:F>\n\n"
-        f"Shuffle will run in {shuffle_target.mention} "
+        f"Shuffled list will run in {shuffle_target.mention} "
         f"for **this upcoming occurrence**."
     )
 
