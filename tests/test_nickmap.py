@@ -170,21 +170,28 @@ import Shuffle  # noqa: E402
 
 
 class NickmapPersistenceTests(unittest.TestCase):
+    def test_normalize_nickmap_key_accepts_short_forms(self):
+        self.assertEqual(Shuffle.normalize_nickmap_key("123456789"), "id:123456789")
+        self.assertEqual(Shuffle.normalize_nickmap_key("@tg_user"), "u:tg_user")
+        self.assertEqual(Shuffle.normalize_nickmap_key("u:tg_user"), "u:tg_user")
+
     def test_save_and_load_nickmap_file_normalizes_records(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = os.path.join(tmp_dir, "nickmap.json")
             saved = Shuffle.save_nickmap_file(
                 {
                     "mappings": {
+                        "123": {"dc_name": "Raw Numeric"},
                         "u:bob": {"dc_name": "Bob"},
-                        "id:123": "Alice",
+                        "id:456": "Alice",
                     }
                 },
                 path,
             )
 
-            self.assertEqual(list(saved["mappings"].keys()), ["id:123", "u:bob"])
-            self.assertEqual(saved["mappings"]["id:123"], {"dc_name": "Alice"})
+            self.assertEqual(list(saved["mappings"].keys()), ["id:123", "id:456", "u:bob"])
+            self.assertEqual(saved["mappings"]["id:123"], {"dc_name": "Raw Numeric"})
+            self.assertEqual(saved["mappings"]["id:456"], {"dc_name": "Alice"})
 
             loaded = Shuffle.load_nickmap_file(path)
             self.assertEqual(loaded, saved)
@@ -207,6 +214,29 @@ class NickmapPersistenceTests(unittest.TestCase):
             with open(path, "r", encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "second\n")
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(tmp_dir)))
+
+    def test_refresh_existing_nickmap_files_normalizes_and_regenerates(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original_json_path = Shuffle.NICKMAP_JSON_PATH
+            original_tengo_path = Shuffle.NICKMAP_TENGO_PATH
+            Shuffle.NICKMAP_JSON_PATH = os.path.join(tmp_dir, "nickmap.json")
+            Shuffle.NICKMAP_TENGO_PATH = os.path.join(tmp_dir, "nickmap.tengo")
+            try:
+                with open(Shuffle.NICKMAP_JSON_PATH, "w", encoding="utf-8") as fh:
+                    json.dump({"mappings": {"123": "Alice"}}, fh)
+
+                self.assertEqual(Shuffle.refresh_existing_nickmap_files(), 1)
+
+                with open(Shuffle.NICKMAP_JSON_PATH, "r", encoding="utf-8") as fh:
+                    raw_json = json.load(fh)
+                with open(Shuffle.NICKMAP_TENGO_PATH, "r", encoding="utf-8") as fh:
+                    raw_tengo = fh.read()
+
+                self.assertEqual(list(raw_json["mappings"].keys()), ["id:123"])
+                self.assertIn('"id:123": "Alice"', raw_tengo)
+            finally:
+                Shuffle.NICKMAP_JSON_PATH = original_json_path
+                Shuffle.NICKMAP_TENGO_PATH = original_tengo_path
 
     def test_persistent_shuffle_exclusions_are_saved_atomically(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

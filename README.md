@@ -90,6 +90,8 @@ Recommended key formats:
 - `u:telegram_username` for a Telegram username without `@`
 - `id:123456789` for a Telegram user ID when available
 
+Short forms are accepted by `/map set`: a bare numeric key such as `123456789` is saved as `id:123456789`, and `@telegram_username` is saved as `u:telegram_username`.
+
 Examples:
 
 ```bash

@@ -1227,6 +1227,15 @@ def normalize_nickmap_key(raw_key: Any) -> str:
         raise ValueError("tg_key cannot be empty.")
     if any(char in key for char in ("\r", "\n", "\0")):
         raise ValueError("tg_key cannot contain control characters.")
+    if key.isdecimal():
+        return f"id:{key}"
+    if key.startswith("@"):
+        username = key[1:].strip()
+        if not username:
+            raise ValueError("tg_key username cannot be empty.")
+        if any(char in username for char in ("\r", "\n", "\0")):
+            raise ValueError("tg_key cannot contain control characters.")
+        return f"u:{username}"
     return key
 
 
@@ -1373,10 +1382,22 @@ def generate_nickmap_tengo(
 
 def write_nickmap_tengo_file(
     data: dict[str, Any],
-    path: str = NICKMAP_TENGO_PATH,
+    path: Optional[str] = None,
 ) -> None:
     """Atomically write the Matterbridge Tengo script."""
-    atomic_write_text(path, generate_nickmap_tengo(data))
+    atomic_write_text(path or NICKMAP_TENGO_PATH, generate_nickmap_tengo(data))
+
+
+def refresh_existing_nickmap_files() -> Optional[int]:
+    """Normalize and regenerate nickmap files when a mapping file already exists."""
+    if not os.path.exists(NICKMAP_JSON_PATH):
+        return None
+
+    with FileLock(nickmap_lock_path()):
+        data = load_nickmap_file(NICKMAP_JSON_PATH, strict=True)
+        data = save_nickmap_file(data, NICKMAP_JSON_PATH)
+        write_nickmap_tengo_file(data)
+    return len(data["mappings"])
 
 
 def nickmap_lock_path(path: Optional[str] = None) -> str:
@@ -1766,6 +1787,15 @@ init_voice_tracking_db()
 async def on_ready():
     print(f'{bot.user} connected. Guilds: {len(bot.guilds)}')
     print(f"Runtime data dir: {DATA_DIR}")
+    try:
+        nickmap_count = refresh_existing_nickmap_files()
+        if nickmap_count is not None:
+            print(
+                f"Nickmap files refreshed: {NICKMAP_JSON_PATH} -> "
+                f"{NICKMAP_TENGO_PATH} ({nickmap_count} mapping(s))"
+            )
+    except Exception as e:
+        print(f"Failed to refresh nickmap files: {e}")
     print(
         f"Persistent shuffle exclusions: {PERSISTENT_EXCLUSIONS_FILE} "
         f"({sum(len(user_ids) for user_ids in persistent_shuffle_exclusions.values())} user(s) "
