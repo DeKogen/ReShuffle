@@ -109,6 +109,12 @@ PERSISTENT_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "persistent_shuffle_exclusio
 SHUFFLE_SETTINGS_FILE = os.path.join(DATA_DIR, "shuffle_settings.json")
 SHUFFLE_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_admin_audit.jsonl")
 VOICE_STATS_DB_FILE = os.path.join(DATA_DIR, "voice_activity.sqlite3")
+BUNDLED_QUESTIONS_FILE = os.path.join(BASE_DIR, "questions.json")
+QUESTION_BANK_FILE = resolve_runtime_path(
+    os.getenv("QUESTION_BANK_FILE"),
+    os.path.join(DATA_DIR, "questions.json"),
+)
+QUESTION_STATE_FILE = os.path.join(DATA_DIR, "question_state.json")
 NICKMAP_JSON_PATH = resolve_runtime_path(
     os.getenv("NICKMAP_JSON_PATH"),
     os.path.join(DATA_DIR, "nickmap.json"),
@@ -1198,6 +1204,124 @@ def atomic_write_json(path: str, data: Any) -> None:
     atomic_write_text(path, content)
 
 
+def question_state_lock_path(path: Optional[str] = None) -> str:
+    """Return the sidecar lock path for non-repeating voice question state."""
+    return f"{path or QUESTION_STATE_FILE}.lock"
+
+
+def ensure_question_bank_file() -> None:
+    """Create the editable runtime question bank from the bundled file when missing."""
+    if os.path.exists(QUESTION_BANK_FILE):
+        return
+
+    if not os.path.exists(BUNDLED_QUESTIONS_FILE):
+        return
+
+    if os.path.abspath(QUESTION_BANK_FILE) == os.path.abspath(BUNDLED_QUESTIONS_FILE):
+        return
+
+    try:
+        with open(BUNDLED_QUESTIONS_FILE, "r", encoding="utf-8") as fh:
+            bundled_questions = json.load(fh)
+        atomic_write_json(QUESTION_BANK_FILE, bundled_questions)
+        print(f"Created editable question bank: {QUESTION_BANK_FILE}")
+    except Exception as e:
+        print(f"Failed to create question bank {QUESTION_BANK_FILE}: {e}")
+
+
+def normalize_question_items(raw: Any) -> list[str]:
+    """Normalize supported question JSON shapes into a clean list of question text."""
+    if isinstance(raw, dict):
+        raw_questions = raw.get("questions", [])
+    else:
+        raw_questions = raw
+
+    if not isinstance(raw_questions, list):
+        return []
+
+    questions: list[str] = []
+    seen: set[str] = set()
+    for item in raw_questions:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            text = item["text"].strip()
+        else:
+            continue
+
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        questions.append(text)
+    return questions
+
+
+def load_voice_questions() -> list[str]:
+    """Load the editable question bank."""
+    ensure_question_bank_file()
+    try:
+        with open(QUESTION_BANK_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"Failed to load voice questions from {QUESTION_BANK_FILE}: {e}")
+        return []
+
+    return normalize_question_items(raw)
+
+
+def load_question_state() -> dict[str, Any]:
+    """Load persisted question cycle state."""
+    try:
+        with open(QUESTION_STATE_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Failed to load question state from {QUESTION_STATE_FILE}: {e}")
+        return {}
+
+    return raw if isinstance(raw, dict) else {}
+
+
+def save_question_state(state: dict[str, Any]) -> None:
+    """Persist question cycle state."""
+    atomic_write_json(QUESTION_STATE_FILE, state)
+
+
+def pick_non_repeating_question(questions: list[str]) -> str:
+    """Pick a random question without repeating until the current bank is exhausted."""
+    if not questions:
+        raise ValueError("No questions configured")
+
+    question_set = set(questions)
+    with FileLock(question_state_lock_path()):
+        state = load_question_state()
+        used_questions = [
+            question
+            for question in state.get("used_questions", [])
+            if isinstance(question, str) and question in question_set
+        ]
+        used_set = set(used_questions)
+        available_questions = [
+            question for question in questions
+            if question not in used_set
+        ]
+
+        if not available_questions:
+            used_questions = []
+            available_questions = list(questions)
+
+        selected_question = random.choice(available_questions)
+        used_questions.append(selected_question)
+        save_question_state({
+            "updated_at": utc_now().isoformat(),
+            "used_questions": used_questions,
+        })
+        return selected_question
+
+
 def redact_sensitive_text(value: str) -> str:
     """Redact token-looking strings before writing audit records."""
     redacted = value
@@ -1862,6 +1986,11 @@ async def on_ready():
         f"Event auto-shuffle targets: {EVENT_AUTO_TARGETS_FILE} "
         f"({len(event_auto_shuffle_targets)} voice channel(s))"
     )
+    try:
+        question_count = len(load_voice_questions())
+        print(f"Voice questions: {QUESTION_BANK_FILE} ({question_count} question(s))")
+    except Exception as e:
+        print(f"Failed to load voice question bank: {e}")
     if USE_GUILD_ONLY_APP_COMMANDS:
         try:
             cleared_count = await clear_remote_global_commands_preserving_local_tree()
@@ -5937,6 +6066,56 @@ async def nickmap_export(ctx: commands.Context):
 @bot.hybrid_command(name='ping', description='Test if the bot is responsive')
 async def ping(ctx: commands.Context):
     await send_hybrid_response(ctx, 'Pong!')
+
+
+@bot.hybrid_command(
+    name='question',
+    description='Give a random voice member a non-repeating question'
+)
+async def voice_question(ctx: commands.Context):
+    guild = ctx.guild
+    if guild is None:
+        await send_hybrid_response(ctx, "Эта команда работает только на сервере.", ephemeral=True)
+        return
+
+    if (
+        not isinstance(ctx.author, discord.Member)
+        or ctx.author.voice is None
+        or ctx.author.voice.channel is None
+    ):
+        await send_hybrid_response(ctx, "Нужно быть в голосовом канале.", ephemeral=True)
+        return
+
+    voice_channel = ctx.author.voice.channel
+    members = [
+        member for member in getattr(voice_channel, "members", [])
+        if not getattr(member, "bot", False)
+    ]
+    if not members:
+        await send_hybrid_response(ctx, "В голосовом канале нет людей для вопроса.", ephemeral=True)
+        return
+
+    questions = load_voice_questions()
+    if not questions:
+        await send_hybrid_response(
+            ctx,
+            f"Нет вопросов. Добавь их в `{os.path.basename(QUESTION_BANK_FILE)}`.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        selected_question = pick_non_repeating_question(questions)
+    except Exception as e:
+        print(f"Failed to pick voice question: {e}")
+        await send_hybrid_response(ctx, "Не получилось выбрать вопрос.", ephemeral=True)
+        return
+
+    selected_member = random.choice(members)
+    await send_hybrid_response(
+        ctx,
+        f"{selected_member.mention}, вопрос:\n{selected_question}",
+    )
 
 
 @bot.command(name='sync')

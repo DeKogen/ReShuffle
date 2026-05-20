@@ -54,6 +54,7 @@ python Shuffle.py
 - `/voice_stats [member]` - show today, this week, and all-time voice totals for a member
 - `/voice_sessions [member] [limit]` - show recent tracked voice sessions for a member
 - `/voice_daily [member] [days]` - show per-day totals for the last N days
+- `/question` (or `!question`) - pick a random human from your voice channel and give them a non-repeating question
 - `/ping` - test if the bot is responsive
 - `!sync` - sync application commands to the current guild
 
@@ -64,6 +65,7 @@ python Shuffle.py
 - `SDG_NEWCOMER_ROLE_ID` (optional) - numeric role ID for `нашедшийся`; if unset, the bot matches by role name
 - `SDG_CORE_ROLE_ID` (optional) - numeric role ID for `core`; if unset, the bot matches by role name
 - `RESHUFFLE_DATA_DIR` (optional) - writable directory for runtime state files; useful in Docker
+- `QUESTION_BANK_FILE` (optional) - path to editable JSON question list; defaults to `questions.json` in the runtime data directory
 
 ## Voice Tracking Storage
 - Voice activity is stored in `voice_activity.sqlite3` inside the runtime data directory
@@ -72,6 +74,7 @@ python Shuffle.py
 - Guild hot-joiner settings are stored in `shuffle_settings.json` inside the runtime data directory
 - Scheduled-event auto-post targets are stored in `event_auto_shuffle_targets.json` inside the runtime data directory
 - Exclusion and hot-joiner setting operations are audited to `shuffle_admin_audit.jsonl` inside the runtime data directory
+- Voice questions are read from `questions.json`; used-question cycle state is stored in `question_state.json`
 
 ## Docker
 ```bash
