@@ -228,6 +228,28 @@ class NickmapPersistenceTests(unittest.TestCase):
                 self.assertEqual(fh.read(), "second\n")
             self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(tmp_dir)))
 
+    def test_pick_non_repeating_question_cycles_after_all_questions(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original_state_file = Shuffle.QUESTION_STATE_FILE
+            Shuffle.QUESTION_STATE_FILE = os.path.join(tmp_dir, "question_state.json")
+            try:
+                questions = ["first", "second", "third"]
+
+                picked = {
+                    Shuffle.pick_non_repeating_question(questions)
+                    for _ in questions
+                }
+                self.assertEqual(picked, set(questions))
+
+                next_question = Shuffle.pick_non_repeating_question(questions)
+                self.assertIn(next_question, questions)
+
+                with open(Shuffle.QUESTION_STATE_FILE, "r", encoding="utf-8") as fh:
+                    state = json.load(fh)
+                self.assertEqual(state["used_questions"], [next_question])
+            finally:
+                Shuffle.QUESTION_STATE_FILE = original_state_file
+
     def test_refresh_existing_nickmap_files_normalizes_and_regenerates(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             original_json_path = Shuffle.NICKMAP_JSON_PATH

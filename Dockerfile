@@ -26,6 +26,7 @@ COPY --from=builder /root/.local /home/botuser/.local
 
 # Copy application files
 COPY --chown=botuser:botuser Shuffle.py ./Shuffle.py
+COPY --chown=botuser:botuser questions.json ./questions.json
 
 # Switch to non-root user
 USER botuser
