@@ -11,7 +11,7 @@ import re
 import tempfile
 import traceback
 from itertools import combinations
-from typing import Any, Optional
+from typing import Any, Optional, Union
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -5323,12 +5323,12 @@ async def attach_event(ctx: commands.Context, event_id: str):
 )
 @discord.app_commands.describe(
     voice_channel='Voice channel used by scheduled events',
-    text_channel='Text channel where planned/shuffle messages should be posted',
+    target_channel='Text channel or voice-channel chat where planned/shuffle messages should be posted',
 )
 async def event_shuffle_target_add(
     ctx: commands.Context,
     voice_channel: discord.VoiceChannel,
-    text_channel: discord.TextChannel,
+    target_channel: Union[discord.TextChannel, discord.VoiceChannel],
 ):
     await defer_hybrid_command(ctx)
 
@@ -5345,24 +5345,28 @@ async def event_shuffle_target_add(
         )
         return
 
-    if voice_channel.guild.id != guild.id or text_channel.guild.id != guild.id:
+    if voice_channel.guild.id != guild.id or target_channel.guild.id != guild.id:
         await finish_hybrid_command(ctx, "Both channels must be in this server.")
         return
 
-    previous = set_event_auto_shuffle_target(voice_channel.id, text_channel.id)
+    if not is_message_channel(target_channel):
+        await finish_hybrid_command(ctx, "The target channel must support messages.")
+        return
+
+    previous = set_event_auto_shuffle_target(voice_channel.id, target_channel.id)
     scheduled_count = await schedule_auto_shuffle_events_for_voice(
         guild,
         voice_channel.id,
-        text_channel.id,
+        target_channel.id,
     )
     suffix = ""
-    if previous is not None and previous != text_channel.id:
+    if previous is not None and previous != target_channel.id:
         suffix = f" Previous target was <#{previous}>."
 
     await finish_hybrid_command(
         ctx,
         f"Auto-shuffle target saved: scheduled events in {voice_channel.mention} "
-        f"will post in {text_channel.mention}. "
+        f"will post in {target_channel.mention}. "
         f"Scheduled {scheduled_count} upcoming event(s).{suffix}",
     )
 
