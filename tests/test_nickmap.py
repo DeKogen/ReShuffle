@@ -23,6 +23,18 @@ def _identity_decorator(*_args, **_kwargs):
     return decorator
 
 
+def _install_dotenv_stub_if_needed():
+    try:
+        import dotenv  # noqa: F401
+        return
+    except ModuleNotFoundError:
+        pass
+
+    dotenv_stub = types.ModuleType("dotenv")
+    dotenv_stub.load_dotenv = lambda *args, **kwargs: None
+    sys.modules["dotenv"] = dotenv_stub
+
+
 def _install_discord_stub_if_needed():
     try:
         import discord  # noqa: F401
@@ -164,6 +176,7 @@ def _install_discord_stub_if_needed():
     sys.modules["discord.ext.commands"] = commands_stub
 
 
+_install_dotenv_stub_if_needed()
 _install_discord_stub_if_needed()
 
 import Shuffle  # noqa: E402
@@ -267,6 +280,32 @@ class NickmapPersistenceTests(unittest.TestCase):
                 Shuffle.PERSISTENT_EXCLUSIONS_FILE = original_path
                 Shuffle.persistent_shuffle_exclusions.clear()
                 Shuffle.persistent_shuffle_exclusions.update(original_exclusions)
+
+    def test_event_auto_shuffle_targets_are_saved_atomically(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original_path = Shuffle.EVENT_AUTO_TARGETS_FILE
+            original_targets = dict(Shuffle.event_auto_shuffle_targets)
+            Shuffle.EVENT_AUTO_TARGETS_FILE = os.path.join(
+                tmp_dir,
+                "event_auto_shuffle_targets.json",
+            )
+            try:
+                Shuffle.event_auto_shuffle_targets.clear()
+
+                self.assertIsNone(Shuffle.set_event_auto_shuffle_target(200, 100))
+                self.assertEqual(Shuffle.load_event_auto_shuffle_targets(), {200: 100})
+                self.assertEqual(Shuffle.set_event_auto_shuffle_target(200, 101), 100)
+                self.assertEqual(Shuffle.load_event_auto_shuffle_targets(), {200: 101})
+                self.assertEqual(Shuffle.delete_event_auto_shuffle_target(200), 101)
+                self.assertEqual(Shuffle.load_event_auto_shuffle_targets(), {})
+                self.assertFalse(
+                    any(name.endswith(".tmp") for name in os.listdir(tmp_dir)),
+                    "atomic temp files should not be left behind",
+                )
+            finally:
+                Shuffle.EVENT_AUTO_TARGETS_FILE = original_path
+                Shuffle.event_auto_shuffle_targets.clear()
+                Shuffle.event_auto_shuffle_targets.update(original_targets)
 
     def test_generate_nickmap_tengo_is_stable_and_guarded(self):
         first = Shuffle.generate_nickmap_tengo(

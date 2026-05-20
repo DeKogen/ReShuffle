@@ -47,6 +47,9 @@ python Shuffle.py
 - `/schedule_event` - schedule a voice event that auto-runs a shuffled list in the command channel
 - `/schedule_event_menu` - open a modal to schedule an event
 - `/attach_event <event_id>` - attach shuffled-list automation to an existing scheduled event; the bot will not move members between voice rooms
+- `/event_shuffle_target_add <voice_channel> <text_channel>` - auto-post shuffled lists for scheduled events in a voice channel to a text channel; only `Товарищ`
+- `/event_shuffle_target_remove <voice_channel>` - remove an auto-post target for a voice channel; only `Товарищ`
+- `/event_shuffle_target_list` - list configured scheduled-event auto-post targets; only `Товарищ`
 - `/list_events` - list scheduled server events and their IDs
 - `/voice_stats [member]` - show today, this week, and all-time voice totals for a member
 - `/voice_sessions [member] [limit]` - show recent tracked voice sessions for a member
@@ -67,6 +70,7 @@ python Shuffle.py
 - Active sessions survive bot restarts and are reconciled on reconnect/startup
 - Persistent shuffle exclusions are stored in `persistent_shuffle_exclusions.json` inside the runtime data directory
 - Guild hot-joiner settings are stored in `shuffle_settings.json` inside the runtime data directory
+- Scheduled-event auto-post targets are stored in `event_auto_shuffle_targets.json` inside the runtime data directory
 - Exclusion and hot-joiner setting operations are audited to `shuffle_admin_audit.jsonl` inside the runtime data directory
 
 ## Docker
@@ -81,4 +85,4 @@ For persistent runtime state with Docker Compose:
 docker compose up --build -d
 ```
 
-The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, audit logs, and the SQLite voice activity database survive container recreation.
+The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, scheduled-event auto-post targets, audit logs, and the SQLite voice activity database survive container recreation.

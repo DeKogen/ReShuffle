@@ -39,6 +39,7 @@ triggering_event_occurrences: set[tuple[int, int]] = set()
 scheduled_event_tasks: dict[tuple[int, int], asyncio.Task] = {}
 planned_event_messages: dict[tuple[int, int], tuple[int, int]] = {}
 event_text_channel_targets: dict[str, int] = {}
+event_auto_shuffle_targets: dict[int, int] = {}
 persistent_shuffle_exclusions: dict[int, set[int]] = {}
 shuffle_settings: dict[int, dict[str, bool]] = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,6 +104,7 @@ def parse_env_int_set(raw_value: Optional[str], *, var_name: str) -> set[int]:
 
 DATA_DIR = resolve_data_dir()
 EVENT_TARGETS_FILE = os.path.join(DATA_DIR, "event_text_channel_targets.json")
+EVENT_AUTO_TARGETS_FILE = os.path.join(DATA_DIR, "event_auto_shuffle_targets.json")
 PERSISTENT_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "persistent_shuffle_exclusions.json")
 SHUFFLE_SETTINGS_FILE = os.path.join(DATA_DIR, "shuffle_settings.json")
 SHUFFLE_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_admin_audit.jsonl")
@@ -1666,6 +1668,62 @@ def save_event_text_channel_targets() -> None:
         print(f"Failed to save event text-channel targets: {e}")
 
 
+def load_event_auto_shuffle_targets() -> dict[int, int]:
+    """Load voice-channel -> text-channel auto-shuffle bindings from disk."""
+    try:
+        with open(EVENT_AUTO_TARGETS_FILE, "r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print(f"Failed to load event auto-shuffle targets: {e}")
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    loaded: dict[int, int] = {}
+    for voice_channel_id, text_channel_id in raw.items():
+        try:
+            loaded[int(voice_channel_id)] = int(text_channel_id)
+        except (TypeError, ValueError):
+            continue
+    return loaded
+
+
+def save_event_auto_shuffle_targets() -> None:
+    """Persist voice-channel -> text-channel auto-shuffle bindings."""
+    payload = {
+        str(voice_channel_id): text_channel_id
+        for voice_channel_id, text_channel_id in sorted(event_auto_shuffle_targets.items())
+    }
+    try:
+        atomic_write_json(EVENT_AUTO_TARGETS_FILE, payload)
+    except Exception as e:
+        print(f"Failed to save event auto-shuffle targets: {e}")
+
+
+def set_event_auto_shuffle_target(voice_channel_id: int, text_channel_id: int) -> Optional[int]:
+    """Set the auto-shuffle text target for all events in one voice channel."""
+    previous = event_auto_shuffle_targets.get(voice_channel_id)
+    event_auto_shuffle_targets[voice_channel_id] = text_channel_id
+    save_event_auto_shuffle_targets()
+    print(
+        f"Saved auto-shuffle target channel {text_channel_id} "
+        f"for voice channel {voice_channel_id}"
+    )
+    return previous
+
+
+def delete_event_auto_shuffle_target(voice_channel_id: int) -> Optional[int]:
+    """Remove the auto-shuffle text target for one voice channel."""
+    previous = event_auto_shuffle_targets.pop(voice_channel_id, None)
+    if previous is not None:
+        save_event_auto_shuffle_targets()
+        print(f"Removed auto-shuffle target for voice channel {voice_channel_id}")
+    return previous
+
+
 def remember_event_text_channel(
     event_id: int,
     text_channel_id: int,
@@ -1774,6 +1832,7 @@ async def fetch_message_channel(
 
 
 event_text_channel_targets.update(load_event_text_channel_targets())
+event_auto_shuffle_targets.update(load_event_auto_shuffle_targets())
 persistent_shuffle_exclusions.update(load_persistent_shuffle_exclusions())
 shuffle_settings.update(load_shuffle_settings())
 init_voice_tracking_db()
@@ -1798,6 +1857,10 @@ async def on_ready():
         f"Persistent shuffle exclusions: {PERSISTENT_EXCLUSIONS_FILE} "
         f"({sum(len(user_ids) for user_ids in persistent_shuffle_exclusions.values())} user(s) "
         f"across {len(persistent_shuffle_exclusions)} guild(s))"
+    )
+    print(
+        f"Event auto-shuffle targets: {EVENT_AUTO_TARGETS_FILE} "
+        f"({len(event_auto_shuffle_targets)} voice channel(s))"
     )
     if USE_GUILD_ONLY_APP_COMMANDS:
         try:
@@ -1856,6 +1919,7 @@ async def on_ready():
                     guild,
                     ev.id,
                     ev.start_time,
+                    voice_channel_id=voice_channel.id,
                 )
                 if text_channel is None:
                     continue
@@ -1946,6 +2010,7 @@ async def on_guild_scheduled_event_update(before, after):
                 after.guild,
                 after.id,
                 after.start_time,
+                voice_channel_id=voice_channel.id,
             )
             if text_channel is not None:
                 end_time = after.end_time or (after.start_time + timedelta(hours=2))
@@ -2004,8 +2069,10 @@ async def pick_saved_event_text_channel(
     guild: discord.Guild,
     event_id: int,
     start_time: Optional[datetime],
+    *,
+    voice_channel_id: Optional[int] = None,
 ) -> Optional[discord.abc.Messageable]:
-    """Resolve the explicitly saved text target for one event occurrence."""
+    """Resolve an explicit occurrence target, then a voice-channel auto target."""
     target_keys = [make_event_target_key(event_id, start_time), str(event_id)]
     for target_key in target_keys:
         saved_channel_id = event_text_channel_targets.get(target_key)
@@ -2027,7 +2094,23 @@ async def pick_saved_event_text_channel(
         event_text_channel_targets.pop(target_key, None)
         save_event_text_channel_targets()
 
-    print(f"No saved shuffle target for event {event_id}; skipping auto-shuffle")
+    if voice_channel_id is not None:
+        auto_channel_id = event_auto_shuffle_targets.get(voice_channel_id)
+        if auto_channel_id is not None:
+            auto_channel = await fetch_message_channel(guild, auto_channel_id)
+            if auto_channel is not None:
+                print(
+                    f"Using auto-shuffle target channel {auto_channel_id} "
+                    f"for event {event_id} in voice channel {voice_channel_id}"
+                )
+                return auto_channel
+
+            print(
+                f"Auto-shuffle text channel {auto_channel_id} for voice channel "
+                f"{voice_channel_id} is not available"
+            )
+
+    print(f"No saved or auto-shuffle target for event {event_id}; skipping auto-shuffle")
     return None
 
 
@@ -2246,6 +2329,50 @@ def schedule_event_lifecycle(
     scheduled_event_tasks[key] = task
 
 
+async def schedule_auto_shuffle_events_for_voice(
+    guild: discord.Guild,
+    voice_channel_id: int,
+    text_channel_id: int,
+) -> int:
+    """Schedule lifecycle tasks for existing future events in a mapped voice channel."""
+    try:
+        events = await guild.fetch_scheduled_events()
+    except Exception as e:
+        print(f"Failed to fetch scheduled events for auto-shuffle target: {e}")
+        return 0
+
+    scheduled_count = 0
+    now = datetime.now(timezone.utc)
+    for ev in events:
+        if is_frozen_event(ev):
+            continue
+        if (
+            ev.entity_type is not discord.EntityType.voice
+            or ev.channel_id != voice_channel_id
+            or ev.start_time is None
+            or ev.start_time <= now
+            or ev.status is not discord.EventStatus.scheduled
+        ):
+            continue
+
+        explicit_keys = [make_event_target_key(ev.id, ev.start_time), str(ev.id)]
+        if any(key in event_text_channel_targets for key in explicit_keys):
+            continue
+
+        end_time = ev.end_time or (ev.start_time + timedelta(hours=2))
+        schedule_event_lifecycle(
+            guild.id,
+            ev.id,
+            ev.start_time,
+            end_time,
+            text_channel_id,
+            replace_existing=True,
+        )
+        scheduled_count += 1
+
+    return scheduled_count
+
+
 async def trigger_shuffle_for_event(
     event: discord.ScheduledEvent,
     *,
@@ -2283,6 +2410,7 @@ async def trigger_shuffle_for_event(
                 guild,
                 event.id,
                 event.start_time,
+                voice_channel_id=voice_channel.id,
             )
         if text_channel is None:
             print(f"No text channel found for voice channel {voice_channel.id}")
@@ -5183,6 +5311,137 @@ async def attach_event(ctx: commands.Context, event_id: str):
         shuffle_target.id,
         replace_existing=True,
     )
+
+
+# ===============================
+#   COMMANDS: event auto-shuffle targets
+# ===============================
+
+@bot.hybrid_command(
+    name='event_shuffle_target_add',
+    description='Auto-post voice scheduled-event shuffles to a text channel'
+)
+@discord.app_commands.describe(
+    voice_channel='Voice channel used by scheduled events',
+    text_channel='Text channel where planned/shuffle messages should be posted',
+)
+async def event_shuffle_target_add(
+    ctx: commands.Context,
+    voice_channel: discord.VoiceChannel,
+    text_channel: discord.TextChannel,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to manage event shuffle targets. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    if voice_channel.guild.id != guild.id or text_channel.guild.id != guild.id:
+        await finish_hybrid_command(ctx, "Both channels must be in this server.")
+        return
+
+    previous = set_event_auto_shuffle_target(voice_channel.id, text_channel.id)
+    scheduled_count = await schedule_auto_shuffle_events_for_voice(
+        guild,
+        voice_channel.id,
+        text_channel.id,
+    )
+    suffix = ""
+    if previous is not None and previous != text_channel.id:
+        suffix = f" Previous target was <#{previous}>."
+
+    await finish_hybrid_command(
+        ctx,
+        f"Auto-shuffle target saved: scheduled events in {voice_channel.mention} "
+        f"will post in {text_channel.mention}. "
+        f"Scheduled {scheduled_count} upcoming event(s).{suffix}",
+    )
+
+
+@bot.hybrid_command(
+    name='event_shuffle_target_remove',
+    description='Remove auto-posting for scheduled events in a voice channel'
+)
+@discord.app_commands.describe(
+    voice_channel='Voice channel whose scheduled events should stop auto-posting',
+)
+async def event_shuffle_target_remove(
+    ctx: commands.Context,
+    voice_channel: discord.VoiceChannel,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to manage event shuffle targets. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    if voice_channel.guild.id != guild.id:
+        await finish_hybrid_command(ctx, "The voice channel must be in this server.")
+        return
+
+    previous = delete_event_auto_shuffle_target(voice_channel.id)
+    if previous is None:
+        await finish_hybrid_command(ctx, f"No auto-shuffle target was set for {voice_channel.mention}.")
+        return
+
+    await finish_hybrid_command(
+        ctx,
+        f"Auto-shuffle target removed for {voice_channel.mention}. "
+        f"Previous text channel was <#{previous}>.",
+    )
+
+
+@bot.hybrid_command(
+    name='event_shuffle_target_list',
+    description='List voice channels that auto-post scheduled-event shuffles'
+)
+async def event_shuffle_target_list(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to view event shuffle targets. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    if not event_auto_shuffle_targets:
+        await finish_hybrid_command(ctx, "No event auto-shuffle targets are configured.")
+        return
+
+    lines = ["**Event auto-shuffle targets**"]
+    for voice_channel_id, text_channel_id in sorted(event_auto_shuffle_targets.items()):
+        voice_channel = guild.get_channel(voice_channel_id)
+        text_channel = resolve_message_channel(guild, text_channel_id)
+        voice_label = voice_channel.mention if voice_channel else f"`{voice_channel_id}`"
+        text_label = text_channel.mention if text_channel else f"<#{text_channel_id}>"
+        lines.append(f"{voice_label} -> {text_label}")
+
+    await send_hybrid_response(ctx, "\n".join(lines), ephemeral=True)
 
 
 # ===============================
