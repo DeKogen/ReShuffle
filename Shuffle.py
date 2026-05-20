@@ -5448,16 +5448,16 @@ async def attach_event(ctx: commands.Context, event_id: str):
 
 @bot.hybrid_command(
     name='event_shuffle_target_add',
-    description='Auto-post voice scheduled-event shuffles to a text channel'
+    description='Auto-post voice scheduled-event shuffles to a channel chat'
 )
 @discord.app_commands.describe(
     voice_channel='Voice channel used by scheduled events',
-    target_channel='Text channel or voice-channel chat where planned/shuffle messages should be posted',
+    target_channel='Optional target; defaults to the selected voice-channel chat',
 )
 async def event_shuffle_target_add(
     ctx: commands.Context,
     voice_channel: discord.VoiceChannel,
-    target_channel: Union[discord.TextChannel, discord.VoiceChannel],
+    target_channel: Optional[Union[discord.TextChannel, discord.VoiceChannel]] = None,
 ):
     await defer_hybrid_command(ctx)
 
@@ -5473,6 +5473,8 @@ async def event_shuffle_target_add(
             f"Required role: `{RELIABLE_ROLE_NAME}`.",
         )
         return
+
+    target_channel = target_channel or voice_channel
 
     if voice_channel.guild.id != guild.id or target_channel.guild.id != guild.id:
         await finish_hybrid_command(ctx, "Both channels must be in this server.")
