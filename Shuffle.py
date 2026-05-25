@@ -40,7 +40,7 @@ planned_event_messages: dict[tuple[int, int], tuple[int, int]] = {}
 event_text_channel_targets: dict[str, int] = {}
 event_auto_shuffle_targets: dict[int, int] = {}
 persistent_shuffle_exclusions: dict[int, set[int]] = {}
-shuffle_settings: dict[int, dict[str, bool]] = {}
+shuffle_settings: dict[int, dict[str, Any]] = {}
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOCAL_TIMEZONE = datetime.now().astimezone().tzinfo or timezone.utc
 
@@ -63,6 +63,7 @@ SDG_PAIR_WEIGHT_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 4
 SDG_HIGHER_ROLE_STACK_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 5
 SDG_PLAN_SCORE_SIZE = SDG_FRESH_STAGE_COUNT + 6
 SDG_REPEAT_WEIGHT_DECAY = 4
+PRIORITY_SHUFFLE_DEFAULT_CHANNEL_NAME = "mastermind"
 
 
 def resolve_data_dir() -> str:
@@ -951,7 +952,21 @@ def format_member_list(guild: discord.Guild, member_ids: set[int]) -> str:
     return ", ".join(names)
 
 
-def load_shuffle_settings() -> dict[int, dict[str, bool]]:
+def normalize_priority_shuffle_channel_ids(raw_value: Any) -> list[int]:
+    """Normalize configured priority-shuffle voice channel IDs."""
+    if not isinstance(raw_value, (list, set, tuple)):
+        return []
+
+    channel_ids: set[int] = set()
+    for value in raw_value:
+        try:
+            channel_ids.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return sorted(channel_ids)
+
+
+def load_shuffle_settings() -> dict[int, dict[str, Any]]:
     """Load guild-level shuffle behavior settings from disk."""
     try:
         with open(SHUFFLE_SETTINGS_FILE, "r", encoding="utf-8") as fh:
@@ -965,7 +980,7 @@ def load_shuffle_settings() -> dict[int, dict[str, bool]]:
     if not isinstance(raw, dict):
         return {}
 
-    loaded: dict[int, dict[str, bool]] = {}
+    loaded: dict[int, dict[str, Any]] = {}
     for guild_id, settings in raw.items():
         try:
             guild_id_int = int(guild_id)
@@ -978,18 +993,38 @@ def load_shuffle_settings() -> dict[int, dict[str, bool]]:
         loaded[guild_id_int] = {
             "allow_hot_joiners": bool(settings.get("allow_hot_joiners", True)),
             "require_camera": bool(settings.get("require_camera", False)),
+            "priority_shuffle_channel_ids": normalize_priority_shuffle_channel_ids(
+                settings.get("priority_shuffle_channel_ids", [])
+            ),
         }
 
     return loaded
 
 
+def normalize_shuffle_settings_for_storage(settings: dict[str, Any]) -> dict[str, Any]:
+    """Build a JSON-serializable shuffle-settings record."""
+    normalized: dict[str, Any] = {}
+    if "allow_hot_joiners" in settings:
+        normalized["allow_hot_joiners"] = bool(settings.get("allow_hot_joiners", True))
+    if "require_camera" in settings:
+        normalized["require_camera"] = bool(settings.get("require_camera", False))
+
+    priority_channel_ids = normalize_priority_shuffle_channel_ids(
+        settings.get("priority_shuffle_channel_ids", [])
+    )
+    if priority_channel_ids:
+        normalized["priority_shuffle_channel_ids"] = priority_channel_ids
+
+    return normalized
+
+
 def save_shuffle_settings() -> None:
     """Persist guild-level shuffle behavior settings to disk."""
-    serializable = {
-        str(guild_id): settings
-        for guild_id, settings in shuffle_settings.items()
-        if settings
-    }
+    serializable: dict[str, dict[str, Any]] = {}
+    for guild_id, settings in shuffle_settings.items():
+        normalized = normalize_shuffle_settings_for_storage(settings)
+        if normalized:
+            serializable[str(guild_id)] = normalized
 
     try:
         with open(SHUFFLE_SETTINGS_FILE, "w", encoding="utf-8") as fh:
@@ -1023,6 +1058,45 @@ def set_require_camera_for_shuffles(guild_id: int, enabled: bool) -> None:
     guild_settings["require_camera"] = bool(enabled)
     shuffle_settings[guild_id] = guild_settings
     save_shuffle_settings()
+
+
+def get_priority_shuffle_channel_ids(guild_id: int) -> set[int]:
+    """Return manually configured priority-first shuffle voice channel IDs."""
+    settings = shuffle_settings.get(guild_id, {})
+    return set(normalize_priority_shuffle_channel_ids(
+        settings.get("priority_shuffle_channel_ids", [])
+    ))
+
+
+def add_priority_shuffle_channel(guild_id: int, voice_channel_id: int) -> bool:
+    """Persist one priority-first shuffle voice channel ID."""
+    guild_settings = dict(shuffle_settings.get(guild_id, {}))
+    guild_settings.setdefault("allow_hot_joiners", True)
+    guild_settings.setdefault("require_camera", False)
+    channel_ids = get_priority_shuffle_channel_ids(guild_id)
+    before_count = len(channel_ids)
+    channel_ids.add(voice_channel_id)
+    guild_settings["priority_shuffle_channel_ids"] = sorted(channel_ids)
+    shuffle_settings[guild_id] = guild_settings
+    save_shuffle_settings()
+    return len(channel_ids) > before_count
+
+
+def remove_priority_shuffle_channel(guild_id: int, voice_channel_id: int) -> bool:
+    """Remove one priority-first shuffle voice channel ID."""
+    guild_settings = dict(shuffle_settings.get(guild_id, {}))
+    channel_ids = get_priority_shuffle_channel_ids(guild_id)
+    if voice_channel_id not in channel_ids:
+        return False
+
+    channel_ids.remove(voice_channel_id)
+    if channel_ids:
+        guild_settings["priority_shuffle_channel_ids"] = sorted(channel_ids)
+    else:
+        guild_settings.pop("priority_shuffle_channel_ids", None)
+    shuffle_settings[guild_id] = guild_settings
+    save_shuffle_settings()
+    return True
 
 
 def append_shuffle_audit_log(
@@ -1700,6 +1774,19 @@ def normalize_channel_name(name: str) -> str:
     return name.strip("-")
 
 
+def is_default_priority_shuffle_channel(channel: discord.VoiceChannel) -> bool:
+    """Return whether a voice channel uses the built-in priority shuffle rule."""
+    return normalize_channel_name(channel.name) == PRIORITY_SHUFFLE_DEFAULT_CHANNEL_NAME
+
+
+def is_priority_shuffle_channel(channel: discord.VoiceChannel) -> bool:
+    """Return whether text shuffles in this voice channel should use priority-first order."""
+    return (
+        is_default_priority_shuffle_channel(channel)
+        or channel.id in get_priority_shuffle_channel_ids(channel.guild.id)
+    )
+
+
 def pick_text_channel_for_voice(
     voice_channel: discord.VoiceChannel,
 ) -> Optional[discord.TextChannel]:
@@ -2163,17 +2250,38 @@ def build_shuffle_member_label(
     return f"{member.display_name} {' '.join(markers)}"
 
 
-def generate_shuffle_order(members: list[discord.Member]) -> list[int]:
-    """Generate a random order with a trusted member first when available."""
-    trusted_members = [member for member in members if has_trusted_role(member)]
-    if not trusted_members:
-        order = list(members)
-        random.shuffle(order)
+def pick_priority_shuffle_first_member(members: list[discord.Member]) -> Optional[discord.Member]:
+    """Pick the first member for priority text shuffles."""
+    priority_buckets = [
+        [member for member in members if has_trusted_role(member)],
+        [
+            member for member in members
+            if not has_trusted_role(member) and has_reliable_role(member)
+        ],
+    ]
+    for bucket in priority_buckets:
+        if bucket:
+            return random.choice(bucket)
+    return None
+
+
+def generate_shuffle_order(
+    members: list[discord.Member],
+    *,
+    priority_first: bool = False,
+) -> list[int]:
+    """Generate a random order, optionally putting trusted/reliable roles first."""
+    order = list(members)
+    random.shuffle(order)
+
+    if not priority_first:
         return [member.id for member in order]
 
-    first_member = random.choice(trusted_members)
-    remaining_members = [member for member in members if member.id != first_member.id]
-    random.shuffle(remaining_members)
+    first_member = pick_priority_shuffle_first_member(members)
+    if first_member is None:
+        return [member.id for member in order]
+
+    remaining_members = [member for member in order if member.id != first_member.id]
     return [first_member.id] + [member.id for member in remaining_members]
 
 
@@ -2564,6 +2672,7 @@ async def start_shuffle_for_channel(
     *,
     existing_message: Optional[discord.Message] = None,
     excluded_member_ids: Optional[set[int]] = None,
+    priority_first: Optional[bool] = None,
 ) -> None:
     """
     Common shuffle logic:
@@ -2600,7 +2709,10 @@ async def start_shuffle_for_channel(
             await text_channel.send(empty_message)
         return
 
-    order = generate_shuffle_order(members)
+    if priority_first is None:
+        priority_first = is_priority_shuffle_channel(voice_channel)
+
+    order = generate_shuffle_order(members, priority_first=priority_first)
 
     labels: dict[int, str] = {}  # labels for ✨ / 🌌
 
@@ -2637,6 +2749,7 @@ async def start_shuffle_for_channel(
         "ignored_excluded_member_ids": ignored_excluded_member_ids,
         "allow_hot_joiners": allow_hot_joiners,
         "require_camera": require_camera,
+        "priority_first": priority_first,
     }
 
     if require_camera:
@@ -4233,6 +4346,76 @@ async def shuffle_voice_members(
 
 
 @bot.hybrid_command(
+    name='shuffle_priority',
+    description='Shuffle once with `Надежный`, then `Товарищ`, first when available'
+)
+@discord.app_commands.describe(
+    exclude="Mentions, IDs, or exact names to exclude from the shuffle"
+)
+async def shuffle_priority(
+    ctx: commands.Context,
+    *,
+    exclude: str = "",
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if ctx.author.voice is None or ctx.author.voice.channel is None:
+        await ctx.send("You need to be in a voice channel to use this command!")
+        return
+
+    excluded_member_ids: set[int] = set()
+    if exclude.strip():
+        if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+            append_shuffle_audit_log(
+                action="shuffle_priority_exclude_denied",
+                guild=guild,
+                actor=ctx.author if isinstance(ctx.author, discord.Member) else None,
+                channel_id=getattr(ctx.channel, "id", None),
+                details={"raw_exclude": exclude},
+            )
+            await ctx.send(
+                f"You do not have permission to exclude members from shuffles. "
+                f"Required role: {get_shuffle_exclusion_access_label()}.",
+            )
+            return
+
+        excluded_member_ids, unresolved = resolve_excluded_members(guild, exclude)
+        if unresolved:
+            await ctx.send(
+                "Could not resolve these users: "
+                + ", ".join(f"`{value}`" for value in unresolved[:10])
+            )
+            return
+
+        append_shuffle_audit_log(
+            action="shuffle_priority_exclude_once",
+            guild=guild,
+            actor=ctx.author,
+            channel_id=getattr(ctx.channel, "id", None),
+            details={
+                "voice_channel_id": ctx.author.voice.channel.id,
+                "excluded_member_ids": sorted(excluded_member_ids),
+                "excluded_members": format_member_list(guild, excluded_member_ids),
+            },
+        )
+
+    voice_channel = ctx.author.voice.channel
+    await start_shuffle_for_channel(
+        guild,
+        voice_channel,
+        ctx.channel,
+        excluded_member_ids=excluded_member_ids,
+        priority_first=True,
+    )
+    await finish_hybrid_command(ctx, "Priority shuffle posted in this channel.")
+
+
+@bot.hybrid_command(
     name='sdg_shuffle',
     description='Move members into timed pairs/trios using roles `нашедшийся` and `core`'
 )
@@ -4681,6 +4864,175 @@ async def shuffle_exclude_list(ctx: commands.Context):
         ctx,
         "**Persistent shuffle exclusions**\n" + format_member_list(guild, member_ids),
     )
+
+
+@bot.hybrid_command(
+    name='shuffle_priority_channel_add',
+    description='Enable automatic priority-first text shuffle in a voice channel'
+)
+@discord.app_commands.describe(
+    voice_channel='Voice channel where /shuffle should use priority-first order'
+)
+async def shuffle_priority_channel_add(
+    ctx: commands.Context,
+    voice_channel: discord.VoiceChannel,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to manage priority shuffle channels. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    if voice_channel.guild.id != guild.id:
+        await finish_hybrid_command(ctx, "The voice channel must be in this server.")
+        return
+
+    if is_default_priority_shuffle_channel(voice_channel):
+        await finish_hybrid_command(
+            ctx,
+            f"{voice_channel.mention} already uses priority shuffle by default.",
+        )
+        return
+
+    added = add_priority_shuffle_channel(guild.id, voice_channel.id)
+    append_shuffle_audit_log(
+        action="shuffle_priority_channel_add",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "voice_channel_id": voice_channel.id,
+            "voice_channel_name": voice_channel.name,
+            "added": added,
+        },
+    )
+    await finish_hybrid_command(
+        ctx,
+        (
+            f"Priority shuffle enabled for {voice_channel.mention}."
+            if added else
+            f"Priority shuffle was already enabled for {voice_channel.mention}."
+        ),
+    )
+
+
+@bot.hybrid_command(
+    name='shuffle_priority_channel_remove',
+    description='Disable automatic priority-first text shuffle in a voice channel'
+)
+@discord.app_commands.describe(
+    voice_channel='Voice channel to remove from priority-first shuffle'
+)
+async def shuffle_priority_channel_remove(
+    ctx: commands.Context,
+    voice_channel: discord.VoiceChannel,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to manage priority shuffle channels. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    if voice_channel.guild.id != guild.id:
+        await finish_hybrid_command(ctx, "The voice channel must be in this server.")
+        return
+
+    removed = remove_priority_shuffle_channel(guild.id, voice_channel.id)
+    append_shuffle_audit_log(
+        action="shuffle_priority_channel_remove",
+        guild=guild,
+        actor=ctx.author,
+        channel_id=getattr(ctx.channel, "id", None),
+        details={
+            "voice_channel_id": voice_channel.id,
+            "voice_channel_name": voice_channel.name,
+            "removed": removed,
+        },
+    )
+
+    if is_default_priority_shuffle_channel(voice_channel):
+        await finish_hybrid_command(
+            ctx,
+            f"{voice_channel.mention} is still priority-enabled by the built-in `MasterMind` rule.",
+        )
+        return
+
+    await finish_hybrid_command(
+        ctx,
+        (
+            f"Priority shuffle disabled for {voice_channel.mention}."
+            if removed else
+            f"Priority shuffle was not enabled for {voice_channel.mention}."
+        ),
+    )
+
+
+@bot.hybrid_command(
+    name='shuffle_priority_channel_list',
+    description='List voice channels where /shuffle uses priority-first order'
+)
+async def shuffle_priority_channel_list(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_shuffle_exclusion_access(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to view priority shuffle channels. "
+            f"Required role: {get_shuffle_exclusion_access_label()}.",
+        )
+        return
+
+    default_channels = [
+        channel
+        for channel in guild.voice_channels
+        if is_default_priority_shuffle_channel(channel)
+    ]
+    manual_channel_ids = get_priority_shuffle_channel_ids(guild.id)
+
+    lines = ["**Priority text shuffle channels**"]
+    if default_channels:
+        default_labels = ", ".join(channel.mention for channel in default_channels)
+        lines.append(f"Built-in `MasterMind`: {default_labels}")
+    else:
+        lines.append("Built-in `MasterMind`: no matching voice channel found")
+
+    if manual_channel_ids:
+        manual_labels = []
+        for channel_id in sorted(manual_channel_ids):
+            channel = guild.get_channel(channel_id)
+            manual_labels.append(
+                channel.mention
+                if isinstance(channel, discord.VoiceChannel)
+                else f"`{channel_id}` (missing)"
+            )
+        lines.append("Configured: " + ", ".join(manual_labels))
+    else:
+        lines.append("Configured: none")
+
+    await send_hybrid_response(ctx, "\n".join(lines), ephemeral=True)
 
 
 @bot.hybrid_command(

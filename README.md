@@ -36,8 +36,14 @@ python Shuffle.py
 
 ## Commands
 - `/shuffle [exclude]` (or `!shuffle [exclude]`) - shuffle members in your current voice channel; users with `Товарищ` or `надежный` can exclude members by mention, ID, or exact name
+- `/shuffle_priority [exclude]` - one-off shuffle with `Надежный`, then `Товарищ`, first when available
+- `/shuffle_priority_channel_add <voice_channel>` - make `/shuffle` use priority-first order in a voice channel; `MasterMind` does this by default
+- `/shuffle_priority_channel_remove <voice_channel>` - remove a manually configured priority-first shuffle channel
+- `/shuffle_priority_channel_list` - list priority-first shuffle channels
 - `/sdg_shuffle` - start timed breakout-room shuffling from your current voice channel; role `нашедшийся` stays together for 10 minutes, role `core` works like the old `**`, everyone else reshuffles every 5 minutes
 - `/sdg_shuffle_stop` - stop the active timed SDG shuffle in the server
+- `/sdg_next_round` - force the active SDG shuffle to switch to the next round now; only `Товарищ`, `надежный`, or `Move Members`
+- `/sdg_graph` - show the active SDG weighted partner graph; only `Товарищ`, `надежный`, or `Move Members`
 - `/sdg_days [voice_channel]` - list members in a voice channel with how many full days they have been on the server
 - `/shuffle_exclude_add <users>` - add users to a persistent exclusion list for all future shuffles; only `Товарищ` or `надежный`
 - `/shuffle_exclude_remove <users>` - remove users from the persistent exclusion list; only `Товарищ` or `надежный`
@@ -72,7 +78,7 @@ python Shuffle.py
 - Voice activity is stored in `voice_activity.sqlite3` inside the runtime data directory
 - Active sessions survive bot restarts and are reconciled on reconnect/startup
 - Persistent shuffle exclusions are stored in `persistent_shuffle_exclusions.json` inside the runtime data directory
-- Guild hot-joiner settings are stored in `shuffle_settings.json` inside the runtime data directory
+- Guild shuffle settings, including hot-joiners and priority shuffle channels, are stored in `shuffle_settings.json` inside the runtime data directory
 - Scheduled-event auto-post targets are stored in `event_auto_shuffle_targets.json` inside the runtime data directory
 - Exclusion and hot-joiner setting operations are audited to `shuffle_admin_audit.jsonl` inside the runtime data directory
 - Voice questions are read from `questions.json`; used-question cycle state is stored in `question_state.json`
