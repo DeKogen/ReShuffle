@@ -58,8 +58,11 @@ SDG_FRESH_STAGE_COUNT = 18
 SDG_REPEAT_PARTNER_SCORE_INDEX = SDG_FRESH_STAGE_COUNT
 SDG_FRESH_TRIO_OVERLAP_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 1
 SDG_FRESH_IN_TRIO_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 2
-SDG_HIGHER_ROLE_STACK_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 3
-SDG_PLAN_SCORE_SIZE = SDG_FRESH_STAGE_COUNT + 4
+SDG_GLOBAL_REPEAT_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 3
+SDG_PAIR_WEIGHT_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 4
+SDG_HIGHER_ROLE_STACK_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 5
+SDG_PLAN_SCORE_SIZE = SDG_FRESH_STAGE_COUNT + 6
+SDG_REPEAT_WEIGHT_DECAY = 4
 
 
 def resolve_data_dir() -> str:
@@ -2786,6 +2789,83 @@ def sdg_get_seen_partner_ids(session: dict, member_id: int) -> set[int]:
     return set(session.get("fresh_newcomer_partner_history", {}).get(member_id, set()))
 
 
+def sdg_partner_edge_key(left_id: int, right_id: int) -> tuple[int, int]:
+    """Return the normalized undirected edge key for the SDG partner graph."""
+    return (left_id, right_id) if left_id < right_id else (right_id, left_id)
+
+
+def sdg_get_partner_edge_count(session: dict, left_id: int, right_id: int) -> int:
+    """Return how often two members have already shared an SDG group."""
+    edge = session.get("partner_graph", {}).get(sdg_partner_edge_key(left_id, right_id))
+    if isinstance(edge, dict):
+        return int(edge.get("count", 0))
+    if isinstance(edge, int):
+        return edge
+    return 0
+
+
+def sdg_get_pair_base_weight(left_profile: dict, right_profile: dict) -> int:
+    """Score the value of one potential SDG conversation before repeat decay."""
+    fresh_profiles = [
+        profile
+        for profile in (left_profile, right_profile)
+        if profile["is_fresh_newcomer"]
+    ]
+    if fresh_profiles:
+        other_profile = right_profile if fresh_profiles[0] is left_profile else left_profile
+        if other_profile["is_core"]:
+            return 100
+        if other_profile["is_trusted"]:
+            return 80
+        if other_profile["is_reliable"]:
+            return 65
+        if other_profile["is_seasoned_newcomer"]:
+            return 45
+        if other_profile["is_fresh_newcomer"]:
+            return 20
+        return 30
+
+    seasoned_profiles = [
+        profile
+        for profile in (left_profile, right_profile)
+        if profile["is_seasoned_newcomer"]
+    ]
+    if seasoned_profiles:
+        other_profile = right_profile if seasoned_profiles[0] is left_profile else left_profile
+        if other_profile["is_core"]:
+            return 55
+        if other_profile["is_trusted"]:
+            return 45
+        if other_profile["is_reliable"]:
+            return 35
+        if other_profile["is_seasoned_newcomer"]:
+            return 20
+        return 25
+
+    left_is_higher = left_profile["higher_role_rank"] is not None
+    right_is_higher = right_profile["higher_role_rank"] is not None
+    if left_is_higher and right_is_higher:
+        return 15
+    if left_is_higher or right_is_higher:
+        return 30
+    return 20
+
+
+def sdg_get_pair_weight(
+    session: dict,
+    left_id: int,
+    right_id: int,
+    member_profiles_by_id: dict[int, dict],
+) -> int:
+    """Return the current weighted value of a pair after repeat decay."""
+    base_weight = sdg_get_pair_base_weight(
+        member_profiles_by_id[left_id],
+        member_profiles_by_id[right_id],
+    )
+    repeat_count = sdg_get_partner_edge_count(session, left_id, right_id)
+    return base_weight // (SDG_REPEAT_WEIGHT_DECAY ** repeat_count)
+
+
 def sdg_pick_best_higher_role_partner(
     session: dict,
     fresh_member_id: int,
@@ -2907,6 +2987,19 @@ def sdg_score_group_plan(
         if len(fresh_member_ids) >= 2:
             score_parts[SDG_FRESH_TRIO_OVERLAP_SCORE_INDEX] += len(fresh_member_ids)
 
+    repeated_edge_count = 0
+    weighted_pair_value = 0
+    for left_id, right_id in combinations(group_member_ids, 2):
+        repeated_edge_count += sdg_get_partner_edge_count(session, left_id, right_id)
+        weighted_pair_value += sdg_get_pair_weight(
+            session,
+            left_id,
+            right_id,
+            member_profiles_by_id,
+        )
+
+    score_parts[SDG_GLOBAL_REPEAT_SCORE_INDEX] += repeated_edge_count
+    score_parts[SDG_PAIR_WEIGHT_SCORE_INDEX] -= weighted_pair_value
     score_parts[SDG_HIGHER_ROLE_STACK_SCORE_INDEX] += max(0, len(higher_role_member_ids) - 1)
     return tuple(score_parts)
 
@@ -3276,11 +3369,37 @@ def sdg_record_partner_history(
     round_groups: list[dict],
     member_profiles_by_id: dict[int, dict],
 ) -> None:
-    """Remember who each fresh newcomer has already met in this SDG session."""
+    """Remember partner history and weighted graph edges for this SDG session."""
     partner_history = session.setdefault("fresh_newcomer_partner_history", {})
+    partner_graph = session.setdefault("partner_graph", {})
 
     for group in round_groups:
         member_ids = group["member_ids"]
+        for left_id, right_id in combinations(member_ids, 2):
+            if left_id not in member_profiles_by_id or right_id not in member_profiles_by_id:
+                continue
+
+            edge_key = sdg_partner_edge_key(left_id, right_id)
+            repeat_count = sdg_get_partner_edge_count(session, left_id, right_id)
+            base_weight = sdg_get_pair_base_weight(
+                member_profiles_by_id[left_id],
+                member_profiles_by_id[right_id],
+            )
+            edge_weight = base_weight // (SDG_REPEAT_WEIGHT_DECAY ** repeat_count)
+            edge = partner_graph.setdefault(
+                edge_key,
+                {
+                    "count": 0,
+                    "weight": 0,
+                    "last_base_weight": base_weight,
+                    "last_weight": 0,
+                },
+            )
+            edge["count"] = int(edge.get("count", 0)) + 1
+            edge["weight"] = int(edge.get("weight", 0)) + edge_weight
+            edge["last_base_weight"] = base_weight
+            edge["last_weight"] = edge_weight
+
         for member_id in member_ids:
             profile = member_profiles_by_id.get(member_id)
             if profile is None or not profile["is_fresh_newcomer"]:
@@ -4112,6 +4231,7 @@ async def sdg_shuffle(ctx: commands.Context):
         "participant_ids": {member.id for member in participants},
         "paused_member_ids": set(),
         "fresh_newcomer_partner_history": {},
+        "partner_graph": {},
         "round_number": 1,
         "next_round_at": None,
         "message": None,
