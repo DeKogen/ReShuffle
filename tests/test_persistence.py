@@ -42,16 +42,6 @@ def _install_discord_stub_if_needed():
     except ModuleNotFoundError:
         pass
 
-    class _Dummy:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def __getattr__(self, _name):
-            return _Dummy()
-
-        def __call__(self, *args, **kwargs):
-            return _Dummy()
-
     class _DummyType:
         def __init_subclass__(cls, **kwargs):
             super().__init_subclass__()
@@ -83,12 +73,6 @@ def _install_discord_stub_if_needed():
         def add_command(self, *args, **kwargs):
             pass
 
-    class _DummyGroup:
-        command = staticmethod(_identity_decorator)
-
-        def __call__(self, *args, **kwargs):
-            return None
-
     class _DummyBot:
         def __init__(self, *args, **kwargs):
             self.tree = _DummyTree()
@@ -98,13 +82,7 @@ def _install_discord_stub_if_needed():
         event = staticmethod(lambda func: func)
         command = staticmethod(_identity_decorator)
         hybrid_command = staticmethod(_identity_decorator)
-
-        @staticmethod
-        def hybrid_group(*args, **kwargs):
-            def decorator(_func):
-                return _DummyGroup()
-
-            return decorator
+        hybrid_group = staticmethod(_identity_decorator)
 
         def get_channel(self, *args, **kwargs):
             return None
@@ -182,44 +160,10 @@ _install_discord_stub_if_needed()
 import Shuffle  # noqa: E402
 
 
-class NickmapPersistenceTests(unittest.TestCase):
-    def test_normalize_nickmap_key_accepts_short_forms(self):
-        self.assertEqual(Shuffle.normalize_nickmap_key("123456789"), "id:123456789")
-        self.assertEqual(Shuffle.normalize_nickmap_key("@tg_user"), "u:tg_user")
-        self.assertEqual(Shuffle.normalize_nickmap_key("u:tg_user"), "u:tg_user")
-
-    def test_save_and_load_nickmap_file_normalizes_records(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            path = os.path.join(tmp_dir, "nickmap.json")
-            saved = Shuffle.save_nickmap_file(
-                {
-                    "mappings": {
-                        "123": {"dc_name": "Raw Numeric"},
-                        "u:bob": {"dc_name": "Bob"},
-                        "id:456": "Alice",
-                    }
-                },
-                path,
-            )
-
-            self.assertEqual(list(saved["mappings"].keys()), ["id:123", "id:456", "u:bob"])
-            self.assertEqual(saved["mappings"]["id:123"], {"dc_name": "Raw Numeric"})
-            self.assertEqual(saved["mappings"]["id:456"], {"dc_name": "Alice"})
-
-            loaded = Shuffle.load_nickmap_file(path)
-            self.assertEqual(loaded, saved)
-
-            with open(path, "r", encoding="utf-8") as fh:
-                raw = json.load(fh)
-            self.assertEqual(raw, saved)
-            self.assertFalse(
-                any(name.endswith(".tmp") for name in os.listdir(tmp_dir)),
-                "atomic temp files should not be left behind",
-            )
-
+class RuntimePersistenceTests(unittest.TestCase):
     def test_atomic_write_text_replaces_existing_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
-            path = os.path.join(tmp_dir, "nickmap.tengo")
+            path = os.path.join(tmp_dir, "runtime.txt")
 
             Shuffle.atomic_write_text(path, "first\n")
             Shuffle.atomic_write_text(path, "second\n")
@@ -249,29 +193,6 @@ class NickmapPersistenceTests(unittest.TestCase):
                 self.assertEqual(state["used_questions"], [next_question])
             finally:
                 Shuffle.QUESTION_STATE_FILE = original_state_file
-
-    def test_refresh_existing_nickmap_files_normalizes_and_regenerates(self):
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            original_json_path = Shuffle.NICKMAP_JSON_PATH
-            original_tengo_path = Shuffle.NICKMAP_TENGO_PATH
-            Shuffle.NICKMAP_JSON_PATH = os.path.join(tmp_dir, "nickmap.json")
-            Shuffle.NICKMAP_TENGO_PATH = os.path.join(tmp_dir, "nickmap.tengo")
-            try:
-                with open(Shuffle.NICKMAP_JSON_PATH, "w", encoding="utf-8") as fh:
-                    json.dump({"mappings": {"123": "Alice"}}, fh)
-
-                self.assertEqual(Shuffle.refresh_existing_nickmap_files(), 1)
-
-                with open(Shuffle.NICKMAP_JSON_PATH, "r", encoding="utf-8") as fh:
-                    raw_json = json.load(fh)
-                with open(Shuffle.NICKMAP_TENGO_PATH, "r", encoding="utf-8") as fh:
-                    raw_tengo = fh.read()
-
-                self.assertEqual(list(raw_json["mappings"].keys()), ["id:123"])
-                self.assertIn('"id:123": "Alice"', raw_tengo)
-            finally:
-                Shuffle.NICKMAP_JSON_PATH = original_json_path
-                Shuffle.NICKMAP_TENGO_PATH = original_tengo_path
 
     def test_persistent_shuffle_exclusions_are_saved_atomically(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -329,31 +250,7 @@ class NickmapPersistenceTests(unittest.TestCase):
                 Shuffle.event_auto_shuffle_targets.clear()
                 Shuffle.event_auto_shuffle_targets.update(original_targets)
 
-    def test_generate_nickmap_tengo_is_stable_and_guarded(self):
-        first = Shuffle.generate_nickmap_tengo(
-            {
-                "mappings": {
-                    "u:zeta": {"dc_name": "Zed"},
-                    "id:123": {"dc_name": 'Alice "A"'},
-                }
-            }
-        )
-        second = Shuffle.generate_nickmap_tengo(
-            {
-                "mappings": {
-                    "id:123": {"dc_name": 'Alice "A"'},
-                    "u:zeta": {"dc_name": "Zed"},
-                }
-            }
-        )
-
-        self.assertEqual(first, second)
-        self.assertIn('if msgAccount == "telegram.mytelegram" {', first)
-        self.assertLess(first.index('"id:123"'), first.index('"u:zeta"'))
-        self.assertIn('"id:123": "Alice \\"A\\""', first)
-        self.assertIn('msgUsername = mapped', first)
-
-    def test_trusted_role_default_id_can_manage_nickmap(self):
+    def test_trusted_role_default_id_is_configured(self):
         member = types.SimpleNamespace(
             guild_permissions=types.SimpleNamespace(administrator=False),
             roles=[types.SimpleNamespace(id=1434300421647761489, name="anything")],
@@ -361,7 +258,7 @@ class NickmapPersistenceTests(unittest.TestCase):
 
         self.assertEqual(Shuffle.TRUSTED_ROLE_ID, 1434300421647761489)
         self.assertTrue(Shuffle.has_trusted_role(member))
-        self.assertTrue(Shuffle.member_has_nickmap_access(member))
+        self.assertTrue(Shuffle.has_shuffle_exclusion_access(member))
 
 
 if __name__ == "__main__":
