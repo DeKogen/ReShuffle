@@ -38,6 +38,7 @@ python Shuffle.py
 - `/shuffle [exclude]` (or `!shuffle [exclude]`) - shuffle members in your current voice channel; users with `Товарищ` or `надежный` can exclude members by mention, ID, or exact name
 - `/sdg_shuffle` - start timed breakout-room shuffling from your current voice channel; role `нашедшийся` stays together for 10 minutes, role `core` works like the old `**`, everyone else reshuffles every 5 minutes
 - `/sdg_shuffle_stop` - stop the active timed SDG shuffle in the server
+- `/sdg_days [voice_channel]` - list members in a voice channel with how many full days they have been on the server
 - `/shuffle_exclude_add <users>` - add users to a persistent exclusion list for all future shuffles; only `Товарищ` or `надежный`
 - `/shuffle_exclude_remove <users>` - remove users from the persistent exclusion list; only `Товарищ` or `надежный`
 - `/shuffle_exclude_list` - show the current persistent exclusion list; only `Товарищ` or `надежный`
