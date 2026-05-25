@@ -3898,6 +3898,49 @@ def format_sdg_group_members(member_ids: list[int], display_names_by_id: dict[in
     )
 
 
+def format_sdg_server_days(member: discord.Member, reference_time: datetime) -> tuple[int, str]:
+    """Render one member's guild age for the SDG days list."""
+    joined_days = sdg_get_member_join_days(member, reference_time=reference_time)
+    sort_days = joined_days if joined_days is not None else 10**9
+    if joined_days is None:
+        day_label = "unknown"
+    else:
+        day_label = f"{joined_days} day" if joined_days == 1 else f"{joined_days} days"
+
+    profile = sdg_build_member_profile(member, reference_time=reference_time)
+    markers = []
+    if profile["is_core"]:
+        markers.append(f"`{SDG_CORE_ROLE_NAME}`")
+    elif profile["is_fresh_newcomer"]:
+        markers.append(f"fresh `{SDG_NEWCOMER_ROLE_NAME}`")
+    elif profile["is_seasoned_newcomer"]:
+        markers.append(f"`{SDG_NEWCOMER_ROLE_NAME}`")
+
+    marker_text = f" ({', '.join(markers)})" if markers else ""
+    return sort_days, f"- **{member.display_name}** — `{day_label}`{marker_text}"
+
+
+def chunk_sdg_days_lines(header: str, lines: list[str], *, max_length: int = 1900) -> list[str]:
+    """Split a member-day list into Discord-sized messages."""
+    chunks: list[str] = []
+    current_lines = [header]
+    current_length = len(header)
+
+    for line in lines:
+        next_length = current_length + 1 + len(line)
+        if len(current_lines) > 1 and next_length > max_length:
+            chunks.append("\n".join(current_lines))
+            current_lines = [f"{header} (continued)"]
+            current_length = len(current_lines[0])
+            next_length = current_length + 1 + len(line)
+
+        current_lines.append(line)
+        current_length = next_length
+
+    chunks.append("\n".join(current_lines))
+    return chunks
+
+
 def build_sdg_group_line(
     session: dict,
     guild: discord.Guild,
@@ -4594,6 +4637,77 @@ async def sdg_shuffle_stop(ctx: commands.Context):
         return
 
     await finish_hybrid_command(ctx, "SDG shuffle stopped.")
+
+
+@bot.hybrid_command(
+    name='sdg_days',
+    description='List voice members with their number of days on this server'
+)
+@discord.app_commands.describe(
+    voice_channel='Voice channel to list; defaults to your current voice channel'
+)
+async def sdg_days(
+    ctx: commands.Context,
+    voice_channel: Optional[discord.VoiceChannel] = None,
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    target_channel = voice_channel
+    if target_channel is None:
+        if (
+            not isinstance(ctx.author, discord.Member)
+            or ctx.author.voice is None
+            or ctx.author.voice.channel is None
+        ):
+            await ctx.send("Choose a voice channel or join one before using this command.")
+            return
+        target_channel = ctx.author.voice.channel
+
+    if not isinstance(target_channel, discord.VoiceChannel):
+        await ctx.send("This command only works with regular voice channels.")
+        return
+
+    if target_channel.guild.id != guild.id:
+        await ctx.send("The voice channel must be in this server.")
+        return
+
+    members = [member for member in target_channel.members if not member.bot]
+    if not members:
+        await ctx.send(f"No human members found in {target_channel.mention}.")
+        return
+
+    reference_time = utc_now()
+    rendered_members = []
+    for member in members:
+        sort_days, line = format_sdg_server_days(member, reference_time)
+        rendered_members.append(
+            (
+                sort_days,
+                sdg_visible_name(member.display_name).casefold(),
+                line,
+            )
+        )
+    rendered_members.sort(key=lambda item: (item[0], item[1]))
+
+    member_label = "member" if len(members) == 1 else "members"
+    header = (
+        f"📋 **Server days in {target_channel.mention}** "
+        f"(`{len(members)}` {member_label})\n"
+        f"Fresh threshold: `{SDG_NEWCOMER_DAYS_THRESHOLD}` full days or less "
+        f"for role `{SDG_NEWCOMER_ROLE_NAME}`."
+    )
+    chunks = chunk_sdg_days_lines(
+        header,
+        [line for _sort_days, _display_name, line in rendered_members],
+    )
+
+    for chunk in chunks:
+        await ctx.send(chunk)
 
 
 @bot.hybrid_command(
