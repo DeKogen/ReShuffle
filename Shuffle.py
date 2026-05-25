@@ -50,6 +50,7 @@ SHUFFLE_TRACKING_WINDOW = 600  # seconds to keep accepting join/leave updates
 SDG_ROUND_SECONDS = 300  # 5 minutes
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
+EVENT_SHUFFLE_MARKER_PREFIX = "Event occurrence:"
 FROZEN_EVENT_MARKER = "[замороженно]"
 CAMERA_SOURCE_MANUAL = "manual"
 CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
@@ -1627,9 +1628,8 @@ async def on_ready():
         except Exception as e:
             print(f"Failed to sync commands to guild {guild.id}: {e}")
 
-    # Do not replay shuffles for events that were already active before startup.
-    # A restart clears in-memory dedupe state, so we only mark those occurrences
-    # as seen to prevent duplicate shuffle messages after reconnects/redeploys.
+    # Reconcile existing events after reconnect/redeploy. Active events are checked
+    # against event-specific shuffle markers before running to avoid false skips.
     for guild in bot.guilds:
         try:
             events = await guild.fetch_scheduled_events()
@@ -1642,8 +1642,7 @@ async def on_ready():
                 continue
 
             if ev.status is discord.EventStatus.active:
-                start_ts = int(ev.start_time.timestamp()) if ev.start_time else 0
-                triggered_event_occurrences.add((ev.id, start_ts))
+                await trigger_shuffle_for_event(ev)
                 continue
 
             if (
@@ -1651,27 +1650,7 @@ async def on_ready():
                 and ev.start_time is not None
                 and ev.start_time > datetime.now(timezone.utc)
             ):
-                voice_channel = guild.get_channel(ev.channel_id) if ev.channel_id else None
-                if not isinstance(voice_channel, discord.VoiceChannel):
-                    continue
-
-                text_channel = await pick_saved_event_text_channel(
-                    guild,
-                    ev.id,
-                    ev.start_time,
-                    voice_channel_id=voice_channel.id,
-                )
-                if text_channel is None:
-                    continue
-
-                end_time = ev.end_time or (ev.start_time + timedelta(hours=2))
-                schedule_event_lifecycle(
-                    guild.id,
-                    ev.id,
-                    ev.start_time,
-                    end_time,
-                    text_channel.id,
-                )
+                await schedule_event_lifecycle_for_event(ev)
 
     await reconcile_active_voice_sessions()
 
@@ -1744,23 +1723,21 @@ async def on_guild_scheduled_event_update(before, after):
         and after.start_time is not None
         and after.status is discord.EventStatus.scheduled
     ):
-        voice_channel = after.guild.get_channel(after.channel_id) if after.channel_id else None
-        if isinstance(voice_channel, discord.VoiceChannel):
-            text_channel = await pick_saved_event_text_channel(
-                after.guild,
-                after.id,
-                after.start_time,
-                voice_channel_id=voice_channel.id,
-            )
-            if text_channel is not None:
-                end_time = after.end_time or (after.start_time + timedelta(hours=2))
-                schedule_event_lifecycle(
-                    after.guild.id,
-                    after.id,
-                    after.start_time,
-                    end_time,
-                    text_channel.id,
-                )
+        await schedule_event_lifecycle_for_event(after)
+
+
+@bot.event
+async def on_guild_scheduled_event_create(event: discord.ScheduledEvent):
+    """Schedule auto-shuffle handling for newly created voice events."""
+    if is_frozen_event(event):
+        return
+
+    if event.status is discord.EventStatus.active:
+        await trigger_shuffle_for_event(event)
+        return
+
+    if event.status is discord.EventStatus.scheduled:
+        await schedule_event_lifecycle_for_event(event)
 
 
 # -------- Shuffle helpers --------
@@ -1872,6 +1849,22 @@ def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple
     return (event_id, start_ts)
 
 
+def build_event_shuffle_marker(event_id: int, start_time: Optional[datetime]) -> str:
+    """Build an event-specific marker for duplicate detection."""
+    event_id_part, start_ts = event_occurrence_key(event_id, start_time)
+    return f"{EVENT_SHUFFLE_MARKER_PREFIX} `{event_id_part}:{start_ts}`"
+
+
+def build_event_context(event: discord.ScheduledEvent) -> dict[str, Any]:
+    """Build lightweight context included in auto-shuffle messages."""
+    return {
+        "id": event.id,
+        "name": event.name,
+        "start_time": event.start_time,
+        "marker": build_event_shuffle_marker(event.id, event.start_time),
+    }
+
+
 def build_planned_shuffle_content(
     event_name: str,
     voice_channel: discord.VoiceChannel,
@@ -1895,16 +1888,28 @@ async def find_reusable_event_message(
     planned_message = None
 
     key = event_occurrence_key(event.id, event.start_time)
+    event_marker = build_event_shuffle_marker(event.id, event.start_time)
+    planned_prefix = f"{PLANNED_SHUFFLE_PREFIX} **{event.name}**"
     stored_message = planned_event_messages.get(key)
     if stored_message is not None:
         stored_channel_id, message_id = stored_message
         if stored_channel_id == text_channel.id:
             try:
-                planned_message = await text_channel.fetch_message(message_id)
+                message = await text_channel.fetch_message(message_id)
+                if (
+                    message.content.startswith(SHUFFLE_LIST_PREFIX)
+                    and event_marker in message.content
+                ):
+                    shuffle_message = message
+                elif message.content.startswith(PLANNED_SHUFFLE_PREFIX):
+                    planned_message = message
             except discord.NotFound:
                 planned_event_messages.pop(key, None)
             except Exception as e:
                 print(f"Could not fetch planned message for event {event.id}: {e}")
+
+    if shuffle_message is not None:
+        return shuffle_message, planned_message
 
     after = (
         event.start_time - timedelta(minutes=2)
@@ -1916,12 +1921,16 @@ async def find_reusable_event_message(
         async for message in text_channel.history(limit=None, after=after):
             if bot.user is None or message.author.id != bot.user.id:
                 continue
-            if message.content.startswith(SHUFFLE_LIST_PREFIX):
+            if (
+                message.content.startswith(SHUFFLE_LIST_PREFIX)
+                and event_marker in message.content
+            ):
                 shuffle_message = message
                 break
             if (
                 planned_message is None
                 and message.content.startswith(PLANNED_SHUFFLE_PREFIX)
+                and message.content.startswith(planned_prefix)
             ):
                 planned_message = message
     except Exception as e:
@@ -1965,6 +1974,49 @@ async def send_planned_shuffle_notice(
 
     planned_event_messages[key] = (text_channel.id, message.id)
     return message
+
+
+async def schedule_event_lifecycle_for_event(
+    event: discord.ScheduledEvent,
+    *,
+    replace_existing: bool = False,
+) -> bool:
+    """Schedule notice/start/end handling for a targeted future voice event."""
+    if is_frozen_event(event):
+        return False
+    if event.entity_type is not discord.EntityType.voice:
+        return False
+    if event.start_time is None or event.start_time <= datetime.now(timezone.utc):
+        return False
+    if event.status is not discord.EventStatus.scheduled:
+        return False
+    if event.channel_id is None:
+        return False
+
+    guild = event.guild
+    voice_channel = guild.get_channel(event.channel_id)
+    if not isinstance(voice_channel, discord.VoiceChannel):
+        return False
+
+    text_channel = await pick_saved_event_text_channel(
+        guild,
+        event.id,
+        event.start_time,
+        voice_channel_id=voice_channel.id,
+    )
+    if text_channel is None:
+        return False
+
+    end_time = event.end_time or (event.start_time + timedelta(hours=2))
+    schedule_event_lifecycle(
+        guild.id,
+        event.id,
+        event.start_time,
+        end_time,
+        text_channel.id,
+        replace_existing=replace_existing,
+    )
+    return True
 
 
 def schedule_event_lifecycle(
@@ -2182,6 +2234,7 @@ async def trigger_shuffle_for_event(
             voice_channel,
             text_channel,
             existing_message=planned_message,
+            event_context=build_event_context(event),
         )
     finally:
         triggering_event_occurrences.discard(key)
@@ -2194,6 +2247,7 @@ def build_content(
     excluded_member_ids: Optional[set[int]] = None,
     allow_hot_joiners: bool = True,
     require_camera: bool = False,
+    event_context: Optional[dict[str, Any]] = None,
 ) -> str:
     """Build the visual text of the shuffled list, using custom labels if present."""
     if labels is None:
@@ -2202,6 +2256,16 @@ def build_content(
         excluded_member_ids = set()
 
     lines = [SHUFFLE_LIST_PREFIX]
+    if event_context is not None:
+        event_name = event_context.get("name") or "scheduled event"
+        marker = event_context.get("marker")
+        if marker is None:
+            marker = build_event_shuffle_marker(
+                int(event_context.get("id", 0)),
+                event_context.get("start_time"),
+            )
+        lines.append(f"Event: **{event_name}**")
+        lines.append(str(marker))
     lines.append(f"Hot joiners: {'on' if allow_hot_joiners else 'off'}")
     if require_camera:
         lines.append("Camera check: on")
@@ -2305,6 +2369,7 @@ async def update_shuffle_message(state: dict) -> None:
         state.get("ignored_excluded_member_ids", set()),
         state.get("allow_hot_joiners", True),
         state.get("require_camera", False),
+        state.get("event_context"),
     )
     try:
         await state["message"].edit(content=content)
@@ -2673,6 +2738,7 @@ async def start_shuffle_for_channel(
     existing_message: Optional[discord.Message] = None,
     excluded_member_ids: Optional[set[int]] = None,
     priority_first: Optional[bool] = None,
+    event_context: Optional[dict[str, Any]] = None,
 ) -> None:
     """
     Common shuffle logic:
@@ -2723,6 +2789,7 @@ async def start_shuffle_for_channel(
         ignored_excluded_member_ids,
         allow_hot_joiners,
         require_camera,
+        event_context,
     )
     if existing_message is not None:
         try:
@@ -2750,6 +2817,7 @@ async def start_shuffle_for_channel(
         "allow_hot_joiners": allow_hot_joiners,
         "require_camera": require_camera,
         "priority_first": priority_first,
+        "event_context": event_context,
     }
 
     if require_camera:
