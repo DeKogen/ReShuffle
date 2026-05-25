@@ -3396,7 +3396,7 @@ def sdg_record_partner_history(
                 },
             )
             edge["count"] = int(edge.get("count", 0)) + 1
-            edge["weight"] = int(edge.get("weight", 0)) + edge_weight
+            edge["weight"] = edge_weight
             edge["last_base_weight"] = base_weight
             edge["last_weight"] = edge_weight
 
@@ -3603,7 +3603,7 @@ def format_sdg_graph_member_name(guild: discord.Guild, member_id: int) -> str:
 
 
 def normalize_sdg_graph_edge(edge: object) -> tuple[int, int, int, int]:
-    """Return count, total weight, last base weight, and last decayed weight."""
+    """Return count, current weight, last base weight, and last decayed weight."""
     if isinstance(edge, dict):
         return (
             int(edge.get("count", 0)),
@@ -3651,7 +3651,7 @@ def build_sdg_graph_chunks(session: dict, guild: discord.Guild) -> list[str]:
         f"🕸 **SDG partner graph**\n"
         f"Rounds recorded: `{completed_rounds}` | "
         f"`{len(edge_rows)}` {edge_label} | "
-        f"pairings: `{total_pairings}` | total weight: `{total_weight}`\n"
+        f"pairings: `{total_pairings}` | current weight: `{total_weight}`\n"
         f"Repeat decay: each repeated edge is divided by `{SDG_REPEAT_WEIGHT_DECAY}`."
     )
     return chunk_sdg_days_lines(header, [row[4] for row in edge_rows])
@@ -3897,7 +3897,16 @@ async def run_sdg_shuffle_session(guild_id: int) -> None:
                 )
                 return
 
-            await asyncio.sleep(SDG_ROUND_SECONDS)
+            next_round_event = session.setdefault("next_round_event", asyncio.Event())
+            try:
+                await asyncio.wait_for(
+                    next_round_event.wait(),
+                    timeout=SDG_ROUND_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pass
+            else:
+                next_round_event.clear()
     except asyncio.CancelledError:
         raise
     except Exception as error:
@@ -4297,6 +4306,7 @@ async def sdg_shuffle(ctx: commands.Context):
         "partner_graph": {},
         "round_number": 1,
         "next_round_at": None,
+        "next_round_event": asyncio.Event(),
         "message": None,
         "task": None,
     }
@@ -4354,6 +4364,37 @@ async def sdg_shuffle_stop(ctx: commands.Context):
         return
 
     await finish_hybrid_command(ctx, "SDG shuffle stopped.")
+
+
+@bot.hybrid_command(
+    name='sdg_next_round',
+    description='Force the active SDG shuffle to switch to the next round now'
+)
+async def sdg_next_round(ctx: commands.Context):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await ctx.send("This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_sdg_shuffle_access(ctx.author):
+        await ctx.send(
+            f"You do not have permission to force SDG rounds. "
+            f"Required: {get_sdg_shuffle_access_label()}.",
+        )
+        return
+
+    session = active_sdg_shuffles.get(guild.id)
+    if session is None:
+        await finish_hybrid_command(ctx, "No active SDG shuffle is running in this server.")
+        return
+
+    next_round_event = session.setdefault("next_round_event", asyncio.Event())
+    next_round_event.set()
+    session["next_round_at"] = utc_now()
+
+    await finish_hybrid_command(ctx, "SDG shuffle will switch to the next round now.")
 
 
 @bot.hybrid_command(
