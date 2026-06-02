@@ -54,9 +54,11 @@ python Shuffle.py
 - `/schedule_event` - schedule a voice event that auto-runs a shuffled list in the command channel
 - `/schedule_event_menu` - open a modal to schedule an event
 - `/attach_event <event_id>` - attach shuffled-list automation to an existing scheduled event; the bot will not move members between voice rooms
+- `/detach_event <event_id>` - detach/disable shuffled-list automation for one scheduled event occurrence
 - `/event_shuffle_target_add <voice_channel> <target_channel>` - auto-post shuffled lists for scheduled events in a voice channel to a text channel or voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_remove <voice_channel>` - remove an auto-post target for a voice channel; only `Товарищ`
 - `/event_shuffle_target_list` - list configured scheduled-event auto-post targets; only `Товарищ`
+- `/event_shuffle_list` - list scheduled events with shuffle attachment/auto-target status; only `Товарищ`
 - `/list_events` - list scheduled server events and their IDs
 - `/voice_stats [member]` - show today, this week, and all-time voice totals for a member
 - `/voice_sessions [member] [limit]` - show recent tracked voice sessions for a member

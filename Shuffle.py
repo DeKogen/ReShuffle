@@ -51,6 +51,7 @@ SDG_ROUND_SECONDS = 300  # 5 minutes
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
 EVENT_SHUFFLE_MARKER_PREFIX = "Event occurrence:"
+DISABLED_EVENT_SHUFFLE_TARGET_ID = 0
 FROZEN_EVENT_MARKER = "[замороженно]"
 CAMERA_SOURCE_MANUAL = "manual"
 CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
@@ -1381,6 +1382,18 @@ def make_event_target_key(event_id: int, start_time: Optional[datetime]) -> str:
     return f"{event_id}:{start_ts}"
 
 
+def parse_event_id_argument(raw_event_id: str) -> Optional[int]:
+    """Parse a scheduled-event ID from a raw command argument or copied link."""
+    value = raw_event_id.strip().strip("`")
+    if value.lower().startswith("event_id:"):
+        value = value.split(":", 1)[1].strip()
+
+    match = re.search(r"\d{15,25}", value)
+    if match is None:
+        return None
+    return int(match.group(0))
+
+
 def load_event_text_channel_targets() -> dict[str, int]:
     """Load saved event/occurrence -> text channel bindings from disk."""
     try:
@@ -1485,12 +1498,28 @@ def remember_event_text_channel(
     )
 
 
-def forget_event_text_channel(event_id: int, start_time: Optional[datetime]) -> None:
+def disable_event_shuffle_for_occurrence(
+    event_id: int,
+    start_time: Optional[datetime],
+) -> None:
+    """Persist an explicit opt-out for one event occurrence."""
+    key = make_event_target_key(event_id, start_time)
+    event_text_channel_targets[key] = DISABLED_EVENT_SHUFFLE_TARGET_ID
+    save_event_text_channel_targets()
+    print(f"Disabled auto-shuffle for event occurrence {key}")
+
+
+def forget_event_text_channel(
+    event_id: int,
+    start_time: Optional[datetime],
+) -> Optional[int]:
     """Forget a saved text channel for one event occurrence."""
     key = make_event_target_key(event_id, start_time)
-    if event_text_channel_targets.pop(key, None) is not None:
+    previous = event_text_channel_targets.pop(key, None)
+    if previous is not None:
         save_event_text_channel_targets()
         print(f"Removed saved shuffle target for event occurrence {key}")
+    return previous
 
 
 def move_event_text_channel_target(
@@ -1808,6 +1837,9 @@ async def pick_saved_event_text_channel(
         saved_channel_id = event_text_channel_targets.get(target_key)
         if saved_channel_id is None:
             continue
+        if saved_channel_id == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+            print(f"Auto-shuffle disabled for event key {target_key}; skipping event {event_id}")
+            return None
 
         saved_channel = await fetch_message_channel(guild, saved_channel_id)
         if saved_channel is not None:
@@ -1842,6 +1874,40 @@ async def pick_saved_event_text_channel(
 
     print(f"No saved or auto-shuffle target for event {event_id}; skipping auto-shuffle")
     return None
+
+
+def describe_event_shuffle_binding(
+    guild: discord.Guild,
+    event: discord.ScheduledEvent,
+) -> str:
+    """Describe how a scheduled event will be handled by shuffle automation."""
+    if is_frozen_event(event):
+        return "ignored because event is frozen"
+
+    target_keys = [
+        (make_event_target_key(event.id, event.start_time), "this occurrence"),
+        (str(event.id), "legacy event key"),
+    ]
+    for target_key, key_label in target_keys:
+        if target_key not in event_text_channel_targets:
+            continue
+
+        saved_channel_id = event_text_channel_targets[target_key]
+        if saved_channel_id == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+            return f"disabled for {key_label}"
+
+        saved_channel = resolve_message_channel(guild, saved_channel_id)
+        channel_label = saved_channel.mention if saved_channel else f"<#{saved_channel_id}>"
+        return f"attached for {key_label} -> {channel_label}"
+
+    if event.channel_id is not None:
+        auto_channel_id = event_auto_shuffle_targets.get(event.channel_id)
+        if auto_channel_id is not None:
+            auto_channel = resolve_message_channel(guild, auto_channel_id)
+            channel_label = auto_channel.mention if auto_channel else f"<#{auto_channel_id}>"
+            return f"auto via voice channel -> {channel_label}"
+
+    return "not attached"
 
 
 def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple[int, int]:
@@ -5696,14 +5762,9 @@ async def attach_event(ctx: commands.Context, event_id: str):
         await ctx.send("This command can only be used inside a server.")
         return
 
-    # Allow "event_id:123..." format by stripping prefix
-    if event_id.lower().startswith("event_id:"):
-        event_id = event_id.split(":", 1)[1].strip()
-
     # Convert snowflake to int safely
-    try:
-        event_id_int = int(event_id)
-    except ValueError:
+    event_id_int = parse_event_id_argument(event_id)
+    if event_id_int is None:
         await ctx.send(f"`{event_id}` is not a valid event ID (must be a numeric snowflake).")
         return
 
@@ -5766,6 +5827,97 @@ async def attach_event(ctx: commands.Context, event_id: str):
         end_time,
         shuffle_target.id,
         replace_existing=True,
+    )
+
+
+# ===============================
+#   COMMAND: detach_event
+# ===============================
+
+@bot.hybrid_command(
+    name='detach_event',
+    description='Detach shuffled-list automation from one scheduled voice event occurrence'
+)
+async def detach_event(ctx: commands.Context, event_id: str):
+    """Disable auto-shuffle list handling for one scheduled voice event occurrence."""
+    await defer_hybrid_command(ctx)
+
+    user = ctx.author
+    if not isinstance(user, discord.Member) or not has_reliable_role(user):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to detach events. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    event_id_int = parse_event_id_argument(event_id)
+    if event_id_int is None:
+        await finish_hybrid_command(
+            ctx,
+            f"`{event_id}` is not a valid event ID (must be a numeric snowflake).",
+        )
+        return
+
+    try:
+        event = await guild.fetch_scheduled_event(event_id_int)
+    except discord.NotFound:
+        await finish_hybrid_command(ctx, f"No event found with ID `{event_id}`.")
+        return
+    except Exception as e:
+        await finish_hybrid_command(ctx, f"Error fetching event: `{e}`")
+        return
+
+    if event.entity_type != discord.EntityType.voice:
+        await finish_hybrid_command(ctx, "This event is not a voice event. Shuffle is only attached to voice events.")
+        return
+
+    if event.start_time is None:
+        await finish_hybrid_command(
+            ctx,
+            "This event has no start time, so there is no specific occurrence to detach.",
+        )
+        return
+
+    target_key = make_event_target_key(event.id, event.start_time)
+    previous_target = event_text_channel_targets.get(target_key)
+    key = event_occurrence_key(event.id, event.start_time)
+    task = scheduled_event_tasks.pop(key, None)
+    task_cancelled = task is not None and not task.done()
+    if task_cancelled:
+        task.cancel()
+
+    planned_event_messages.pop(key, None)
+    triggered_event_occurrences.discard(key)
+    triggering_event_occurrences.discard(key)
+    disable_event_shuffle_for_occurrence(event.id, event.start_time)
+
+    state_note = "disabled for this upcoming occurrence"
+    if previous_target is None:
+        auto_target = (
+            event_auto_shuffle_targets.get(event.channel_id)
+            if event.channel_id is not None
+            else None
+        )
+        if auto_target is not None:
+            state_note += f"; auto-target <#{auto_target}> is now overridden"
+        else:
+            state_note += "; no explicit attachment existed before"
+    elif previous_target == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+        state_note += "; it was already disabled"
+    else:
+        state_note += f"; previous target was <#{previous_target}>"
+
+    task_note = " Scheduled lifecycle task was cancelled." if task_cancelled else ""
+    await finish_hybrid_command(
+        ctx,
+        f"Detached shuffle from **{event.name}** (`{event.id}`): {state_note}."
+        f"{task_note}",
     )
 
 
@@ -5902,6 +6054,73 @@ async def event_shuffle_target_list(ctx: commands.Context):
         lines.append(f"{voice_label} -> {text_label}")
 
     await send_hybrid_response(ctx, "\n".join(lines), ephemeral=True)
+
+
+# ===============================
+#   COMMAND: event_shuffle_list
+# ===============================
+
+@bot.hybrid_command(
+    name='event_shuffle_list',
+    description='List scheduled events and their shuffle attachment status'
+)
+async def event_shuffle_list(ctx: commands.Context):
+    """Show scheduled/active events with explicit, disabled, or auto shuffle status."""
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to view event shuffle status. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    try:
+        events = await guild.fetch_scheduled_events()
+    except Exception as e:
+        await finish_hybrid_command(ctx, f"Failed to fetch scheduled events: `{e}`")
+        return
+
+    visible_events = [
+        ev for ev in events
+        if ev.status in (discord.EventStatus.scheduled, discord.EventStatus.active)
+    ]
+    if not visible_events:
+        await finish_hybrid_command(ctx, "No scheduled or active events found on this server.")
+        return
+
+    fallback_time = datetime.max.replace(tzinfo=timezone.utc)
+    visible_events.sort(key=lambda ev: ev.start_time or fallback_time)
+
+    lines: list[str] = []
+    for ev in visible_events:
+        start_ts = int(ev.start_time.timestamp()) if ev.start_time else None
+        end_ts = int(ev.end_time.timestamp()) if ev.end_time else None
+        start_label = f"<t:{start_ts}:F>" if start_ts else "`unknown`"
+        end_label = f" | ends: <t:{end_ts}:F>" if end_ts else ""
+
+        voice_channel = guild.get_channel(ev.channel_id) if ev.channel_id else None
+        voice_label = voice_channel.mention if voice_channel else f"`{ev.channel_id or 'none'}`"
+
+        task = scheduled_event_tasks.get(event_occurrence_key(ev.id, ev.start_time))
+        task_label = "scheduled" if task is not None and not task.done() else "not scheduled"
+        shuffle_status = describe_event_shuffle_binding(guild, ev)
+
+        lines.append(
+            f"- **{ev.name}** (`{ev.id}`) — `{ev.status.name}`\n"
+            f"  voice: {voice_label} | starts: {start_label}{end_label}\n"
+            f"  shuffle: {shuffle_status} | task: `{task_label}`"
+        )
+
+    chunks = chunk_sdg_days_lines("**Scheduled event shuffle status**", lines)
+    for chunk in chunks:
+        await send_hybrid_response(ctx, chunk, ephemeral=True)
 
 
 # ===============================
