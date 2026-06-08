@@ -51,6 +51,7 @@ SDG_ROUND_SECONDS = 300  # 5 minutes
 PLANNED_SHUFFLE_PREFIX = "⏳ **Shuffle planned:**"
 SHUFFLE_LIST_PREFIX = "🎲 **Shuffled list:**"
 EVENT_SHUFFLE_MARKER_PREFIX = "Event occurrence:"
+DISABLED_EVENT_SHUFFLE_TARGET_ID = 0
 FROZEN_EVENT_MARKER = "[замороженно]"
 CAMERA_SOURCE_MANUAL = "manual"
 CAMERA_SOURCE_SHUFFLE_PREFIX = "shuffle:"
@@ -65,6 +66,19 @@ SDG_HIGHER_ROLE_STACK_SCORE_INDEX = SDG_FRESH_STAGE_COUNT + 5
 SDG_PLAN_SCORE_SIZE = SDG_FRESH_STAGE_COUNT + 6
 SDG_REPEAT_WEIGHT_DECAY = 4
 PRIORITY_SHUFFLE_DEFAULT_CHANNEL_NAME = "mastermind"
+_mastermind_shuffle_channel_id_env = os.getenv("MASTERMIND_SHUFFLE_CHANNEL_ID")
+MASTERMIND_SHUFFLE_CHANNEL_ID = (
+    int(_mastermind_shuffle_channel_id_env)
+    if _mastermind_shuffle_channel_id_env else
+    1434301778605899808
+)
+_mastermind_shuffle_goal_env = os.getenv("MASTERMIND_SHUFFLE_GOAL")
+MASTERMIND_SHUFFLE_GOAL = (
+    max(1, int(_mastermind_shuffle_goal_env))
+    if _mastermind_shuffle_goal_env else
+    15
+)
+SHUFFLE_COUNT_PROGRESS_SEGMENTS = 15
 
 
 def resolve_data_dir() -> str:
@@ -95,6 +109,7 @@ EVENT_AUTO_TARGETS_FILE = os.path.join(DATA_DIR, "event_auto_shuffle_targets.jso
 PERSISTENT_EXCLUSIONS_FILE = os.path.join(DATA_DIR, "persistent_shuffle_exclusions.json")
 SHUFFLE_SETTINGS_FILE = os.path.join(DATA_DIR, "shuffle_settings.json")
 SHUFFLE_AUDIT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_admin_audit.jsonl")
+SHUFFLE_COUNT_LOG_FILE = os.path.join(DATA_DIR, "shuffle_counts.jsonl")
 VOICE_STATS_DB_FILE = os.path.join(DATA_DIR, "voice_activity.sqlite3")
 BUNDLED_QUESTIONS_FILE = os.path.join(BASE_DIR, "questions.json")
 QUESTION_BANK_FILE = resolve_runtime_path(
@@ -1227,6 +1242,271 @@ def atomic_write_json(path: str, data: Any) -> None:
     atomic_write_text(path, content)
 
 
+def shuffle_count_log_lock_path(path: Optional[str] = None) -> str:
+    """Return the sidecar lock path for MasterMind shuffle count records."""
+    return f"{path or SHUFFLE_COUNT_LOG_FILE}.lock"
+
+
+def is_shuffle_count_channel(voice_channel_id: Optional[int]) -> bool:
+    """Return whether a voice channel should record shuffle counts."""
+    try:
+        return int(voice_channel_id) == MASTERMIND_SHUFFLE_CHANNEL_ID
+    except (TypeError, ValueError):
+        return False
+
+
+def build_shuffle_count_progress(member_count: int, goal: int = MASTERMIND_SHUFFLE_GOAL) -> str:
+    """Render a compact GitHub-style progress bar for a shuffle member count."""
+    member_count = max(0, int(member_count))
+    goal = max(1, int(goal))
+    ratio = min(member_count / goal, 1.0)
+    filled_segments = round(ratio * SHUFFLE_COUNT_PROGRESS_SEGMENTS)
+    if member_count > 0 and filled_segments == 0:
+        filled_segments = 1
+    filled_segments = min(filled_segments, SHUFFLE_COUNT_PROGRESS_SEGMENTS)
+    empty_segments = SHUFFLE_COUNT_PROGRESS_SEGMENTS - filled_segments
+
+    overflow = f" +{member_count - goal}" if member_count > goal else ""
+    return (
+        f"`{member_count}/{goal}` "
+        f"{'🟩' * filled_segments}{'⬜' * empty_segments}{overflow}"
+    )
+
+
+def append_shuffle_count_record(
+    *,
+    guild_id: Optional[int],
+    guild_name: Optional[str],
+    voice_channel_id: int,
+    voice_channel_name: Optional[str],
+    text_channel_id: Optional[int],
+    message_id: Optional[int],
+    member_count: int,
+    goal: int,
+) -> None:
+    """Append one JSONL record when the tracked shuffle member count changes."""
+    record = {
+        "timestamp": utc_now().isoformat(),
+        "guild_id": guild_id,
+        "guild_name": guild_name,
+        "voice_channel_id": voice_channel_id,
+        "voice_channel_name": voice_channel_name,
+        "text_channel_id": text_channel_id,
+        "message_id": message_id,
+        "member_count": member_count,
+        "goal": goal,
+    }
+
+    try:
+        with FileLock(shuffle_count_log_lock_path()):
+            with open(SHUFFLE_COUNT_LOG_FILE, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"Failed to write shuffle count log: {e}")
+
+
+def record_shuffle_member_count_if_needed(
+    state: dict,
+    guild: Optional[discord.Guild] = None,
+) -> None:
+    """Record the current count for tracked shuffle channels after a message update."""
+    voice_channel_id = state.get("voice_channel_id")
+    if not is_shuffle_count_channel(voice_channel_id):
+        return
+
+    member_count = len(state.get("order", []))
+    if state.get("last_recorded_member_count") == member_count:
+        return
+
+    if guild is None:
+        guild = bot.get_guild(state.get("guild_id"))
+
+    voice_channel_name = None
+    if guild is not None:
+        voice_channel = guild.get_channel(voice_channel_id)
+        voice_channel_name = getattr(voice_channel, "name", None)
+
+    append_shuffle_count_record(
+        guild_id=state.get("guild_id"),
+        guild_name=getattr(guild, "name", None),
+        voice_channel_id=int(voice_channel_id),
+        voice_channel_name=voice_channel_name,
+        text_channel_id=state.get("text_channel_id"),
+        message_id=getattr(state.get("message"), "id", None),
+        member_count=member_count,
+        goal=MASTERMIND_SHUFFLE_GOAL,
+    )
+    state["last_recorded_member_count"] = member_count
+
+
+def parse_shuffle_count_month(month: str = "") -> tuple[datetime, datetime, str]:
+    """Parse a YYYY-MM month into a local-time month range stored as UTC."""
+    month = (month or "").strip()
+    if month:
+        match = re.fullmatch(r"(\d{4})-(\d{1,2})", month)
+        if match is None:
+            raise ValueError("Use month format `YYYY-MM`, for example `2026-06`.")
+        year = int(match.group(1))
+        month_number = int(match.group(2))
+        if month_number < 1 or month_number > 12:
+            raise ValueError("Month must be between `01` and `12`.")
+        start_local = datetime(year, month_number, 1, tzinfo=LOCAL_TIMEZONE)
+    else:
+        now_local = utc_now().astimezone(LOCAL_TIMEZONE)
+        start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    if start_local.month == 12:
+        end_local = start_local.replace(year=start_local.year + 1, month=1)
+    else:
+        end_local = start_local.replace(month=start_local.month + 1)
+
+    return (
+        start_local.astimezone(timezone.utc),
+        end_local.astimezone(timezone.utc),
+        start_local.strftime("%Y-%m"),
+    )
+
+
+def iter_shuffle_count_records() -> list[dict[str, Any]]:
+    """Load persisted MasterMind shuffle-count records from the append-only JSONL log."""
+    records: list[dict[str, Any]] = []
+    try:
+        with FileLock(shuffle_count_log_lock_path()):
+            with open(SHUFFLE_COUNT_LOG_FILE, "r", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(record, dict):
+                        records.append(record)
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        print(f"Failed to read shuffle count log: {e}")
+        return []
+
+    return records
+
+
+def load_shuffle_count_records_for_month(
+    *,
+    guild_id: int,
+    range_start: datetime,
+    range_end: datetime,
+    voice_channel_id: int = MASTERMIND_SHUFFLE_CHANNEL_ID,
+) -> list[dict[str, Any]]:
+    """Load count records for one guild/channel in the selected month."""
+    selected: list[dict[str, Any]] = []
+    for record in iter_shuffle_count_records():
+        try:
+            record_guild_id = int(record.get("guild_id"))
+            record_voice_channel_id = int(record.get("voice_channel_id"))
+            member_count = int(record.get("member_count"))
+            timestamp = from_storage_datetime(str(record.get("timestamp")))
+        except (TypeError, ValueError):
+            continue
+
+        if record_guild_id != guild_id or record_voice_channel_id != voice_channel_id:
+            continue
+        if timestamp < range_start or timestamp >= range_end:
+            continue
+
+        normalized = dict(record)
+        normalized["timestamp"] = timestamp
+        normalized["member_count"] = max(0, member_count)
+        selected.append(normalized)
+
+    selected.sort(key=lambda record: record["timestamp"])
+    return selected
+
+
+def summarize_shuffle_count_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse count-change records into one latest count per shuffle message."""
+    grouped: dict[str, dict[str, Any]] = {}
+    for index, record in enumerate(records):
+        message_id = record.get("message_id")
+        text_channel_id = record.get("text_channel_id")
+        if message_id is not None:
+            key = f"message:{message_id}"
+        else:
+            key = f"record:{index}:{record['timestamp'].timestamp()}"
+
+        existing = grouped.get(key)
+        if existing is None:
+            grouped[key] = {
+                "key": key,
+                "first_seen_at": record["timestamp"],
+                "last_seen_at": record["timestamp"],
+                "text_channel_id": text_channel_id,
+                "message_id": message_id,
+                "member_count": record["member_count"],
+                "max_member_count": record["member_count"],
+                "record_count": 1,
+            }
+            continue
+
+        existing["record_count"] += 1
+        existing["max_member_count"] = max(existing["max_member_count"], record["member_count"])
+        if record["timestamp"] >= existing["last_seen_at"]:
+            existing["last_seen_at"] = record["timestamp"]
+            existing["text_channel_id"] = text_channel_id
+            existing["message_id"] = message_id
+            existing["member_count"] = record["member_count"]
+
+    return sorted(grouped.values(), key=lambda item: item["first_seen_at"])
+
+
+def build_shuffle_count_month_lines(
+    guild_id: int,
+    month: str = "",
+) -> tuple[str, list[str]]:
+    """Build a monthly MasterMind shuffle-count report."""
+    range_start, range_end, month_label = parse_shuffle_count_month(month)
+    records = load_shuffle_count_records_for_month(
+        guild_id=guild_id,
+        range_start=range_start,
+        range_end=range_end,
+    )
+    shuffles = summarize_shuffle_count_records(records)
+
+    header = (
+        f"**MasterMind shuffle counts: {month_label}**\n"
+        f"Goal: `{MASTERMIND_SHUFFLE_GOAL}` people | Timezone: `{format_timezone_label()}`"
+    )
+    if not shuffles:
+        return header, ["No saved MasterMind shuffles for this month."]
+
+    counts = [shuffle["max_member_count"] for shuffle in shuffles]
+    best_count = max(counts)
+    goal_hits = sum(1 for count in counts if count >= MASTERMIND_SHUFFLE_GOAL)
+    average_count = sum(counts) / len(counts)
+
+    lines = [
+        (
+            f"Shuffles: `{len(shuffles)}` | Goal hit: `{goal_hits}` | "
+            f"Best: `{best_count}` | Average: `{average_count:.1f}`"
+        )
+    ]
+    for index, shuffle in enumerate(shuffles, start=1):
+        first_seen_ts = int(shuffle["first_seen_at"].timestamp())
+        last_seen_at = shuffle["last_seen_at"]
+        report_count = shuffle["max_member_count"]
+        latest_count = shuffle["member_count"]
+        changed_note = ""
+        if shuffle["record_count"] > 1:
+            changed_note = f" | latest `{latest_count}` at <t:{int(last_seen_at.timestamp())}:t>"
+        lines.append(
+            f"{index}. <t:{first_seen_ts}:d> <t:{first_seen_ts}:t> "
+            f"{build_shuffle_count_progress(report_count)}{changed_note}"
+        )
+
+    return header, lines
+
+
 def question_state_lock_path(path: Optional[str] = None) -> str:
     """Return the sidecar lock path for non-repeating voice question state."""
     return f"{path or QUESTION_STATE_FILE}.lock"
@@ -1381,6 +1661,18 @@ def make_event_target_key(event_id: int, start_time: Optional[datetime]) -> str:
     return f"{event_id}:{start_ts}"
 
 
+def parse_event_id_argument(raw_event_id: str) -> Optional[int]:
+    """Parse a scheduled-event ID from a raw command argument or copied link."""
+    value = raw_event_id.strip().strip("`")
+    if value.lower().startswith("event_id:"):
+        value = value.split(":", 1)[1].strip()
+
+    match = re.search(r"\d{15,25}", value)
+    if match is None:
+        return None
+    return int(match.group(0))
+
+
 def load_event_text_channel_targets() -> dict[str, int]:
     """Load saved event/occurrence -> text channel bindings from disk."""
     try:
@@ -1485,12 +1777,28 @@ def remember_event_text_channel(
     )
 
 
-def forget_event_text_channel(event_id: int, start_time: Optional[datetime]) -> None:
+def disable_event_shuffle_for_occurrence(
+    event_id: int,
+    start_time: Optional[datetime],
+) -> None:
+    """Persist an explicit opt-out for one event occurrence."""
+    key = make_event_target_key(event_id, start_time)
+    event_text_channel_targets[key] = DISABLED_EVENT_SHUFFLE_TARGET_ID
+    save_event_text_channel_targets()
+    print(f"Disabled auto-shuffle for event occurrence {key}")
+
+
+def forget_event_text_channel(
+    event_id: int,
+    start_time: Optional[datetime],
+) -> Optional[int]:
     """Forget a saved text channel for one event occurrence."""
     key = make_event_target_key(event_id, start_time)
-    if event_text_channel_targets.pop(key, None) is not None:
+    previous = event_text_channel_targets.pop(key, None)
+    if previous is not None:
         save_event_text_channel_targets()
         print(f"Removed saved shuffle target for event occurrence {key}")
+    return previous
 
 
 def move_event_text_channel_target(
@@ -1808,6 +2116,9 @@ async def pick_saved_event_text_channel(
         saved_channel_id = event_text_channel_targets.get(target_key)
         if saved_channel_id is None:
             continue
+        if saved_channel_id == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+            print(f"Auto-shuffle disabled for event key {target_key}; skipping event {event_id}")
+            return None
 
         saved_channel = await fetch_message_channel(guild, saved_channel_id)
         if saved_channel is not None:
@@ -1842,6 +2153,40 @@ async def pick_saved_event_text_channel(
 
     print(f"No saved or auto-shuffle target for event {event_id}; skipping auto-shuffle")
     return None
+
+
+def describe_event_shuffle_binding(
+    guild: discord.Guild,
+    event: discord.ScheduledEvent,
+) -> str:
+    """Describe how a scheduled event will be handled by shuffle automation."""
+    if is_frozen_event(event):
+        return "ignored because event is frozen"
+
+    target_keys = [
+        (make_event_target_key(event.id, event.start_time), "this occurrence"),
+        (str(event.id), "legacy event key"),
+    ]
+    for target_key, key_label in target_keys:
+        if target_key not in event_text_channel_targets:
+            continue
+
+        saved_channel_id = event_text_channel_targets[target_key]
+        if saved_channel_id == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+            return f"disabled for {key_label}"
+
+        saved_channel = resolve_message_channel(guild, saved_channel_id)
+        channel_label = saved_channel.mention if saved_channel else f"<#{saved_channel_id}>"
+        return f"attached for {key_label} -> {channel_label}"
+
+    if event.channel_id is not None:
+        auto_channel_id = event_auto_shuffle_targets.get(event.channel_id)
+        if auto_channel_id is not None:
+            auto_channel = resolve_message_channel(guild, auto_channel_id)
+            channel_label = auto_channel.mention if auto_channel else f"<#{auto_channel_id}>"
+            return f"auto via voice channel -> {channel_label}"
+
+    return "not attached"
 
 
 def event_occurrence_key(event_id: int, start_time: Optional[datetime]) -> tuple[int, int]:
@@ -2373,6 +2718,7 @@ async def update_shuffle_message(state: dict) -> None:
     )
     try:
         await state["message"].edit(content=content)
+        record_shuffle_member_count_if_needed(state, guild)
     except discord.NotFound:
         # message deleted -> clean up state
         active_shuffles.pop(state["text_channel_id"], None)
@@ -2818,7 +3164,9 @@ async def start_shuffle_for_channel(
         "require_camera": require_camera,
         "priority_first": priority_first,
         "event_context": event_context,
+        "last_recorded_member_count": None,
     }
+    record_shuffle_member_count_if_needed(active_shuffles[text_channel.id], guild)
 
     if require_camera:
         start_camera_enforcement(
@@ -5696,14 +6044,9 @@ async def attach_event(ctx: commands.Context, event_id: str):
         await ctx.send("This command can only be used inside a server.")
         return
 
-    # Allow "event_id:123..." format by stripping prefix
-    if event_id.lower().startswith("event_id:"):
-        event_id = event_id.split(":", 1)[1].strip()
-
     # Convert snowflake to int safely
-    try:
-        event_id_int = int(event_id)
-    except ValueError:
+    event_id_int = parse_event_id_argument(event_id)
+    if event_id_int is None:
         await ctx.send(f"`{event_id}` is not a valid event ID (must be a numeric snowflake).")
         return
 
@@ -5766,6 +6109,97 @@ async def attach_event(ctx: commands.Context, event_id: str):
         end_time,
         shuffle_target.id,
         replace_existing=True,
+    )
+
+
+# ===============================
+#   COMMAND: detach_event
+# ===============================
+
+@bot.hybrid_command(
+    name='detach_event',
+    description='Detach shuffled-list automation from one scheduled voice event occurrence'
+)
+async def detach_event(ctx: commands.Context, event_id: str):
+    """Disable auto-shuffle list handling for one scheduled voice event occurrence."""
+    await defer_hybrid_command(ctx)
+
+    user = ctx.author
+    if not isinstance(user, discord.Member) or not has_reliable_role(user):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to detach events. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    event_id_int = parse_event_id_argument(event_id)
+    if event_id_int is None:
+        await finish_hybrid_command(
+            ctx,
+            f"`{event_id}` is not a valid event ID (must be a numeric snowflake).",
+        )
+        return
+
+    try:
+        event = await guild.fetch_scheduled_event(event_id_int)
+    except discord.NotFound:
+        await finish_hybrid_command(ctx, f"No event found with ID `{event_id}`.")
+        return
+    except Exception as e:
+        await finish_hybrid_command(ctx, f"Error fetching event: `{e}`")
+        return
+
+    if event.entity_type != discord.EntityType.voice:
+        await finish_hybrid_command(ctx, "This event is not a voice event. Shuffle is only attached to voice events.")
+        return
+
+    if event.start_time is None:
+        await finish_hybrid_command(
+            ctx,
+            "This event has no start time, so there is no specific occurrence to detach.",
+        )
+        return
+
+    target_key = make_event_target_key(event.id, event.start_time)
+    previous_target = event_text_channel_targets.get(target_key)
+    key = event_occurrence_key(event.id, event.start_time)
+    task = scheduled_event_tasks.pop(key, None)
+    task_cancelled = task is not None and not task.done()
+    if task_cancelled:
+        task.cancel()
+
+    planned_event_messages.pop(key, None)
+    triggered_event_occurrences.discard(key)
+    triggering_event_occurrences.discard(key)
+    disable_event_shuffle_for_occurrence(event.id, event.start_time)
+
+    state_note = "disabled for this upcoming occurrence"
+    if previous_target is None:
+        auto_target = (
+            event_auto_shuffle_targets.get(event.channel_id)
+            if event.channel_id is not None
+            else None
+        )
+        if auto_target is not None:
+            state_note += f"; auto-target <#{auto_target}> is now overridden"
+        else:
+            state_note += "; no explicit attachment existed before"
+    elif previous_target == DISABLED_EVENT_SHUFFLE_TARGET_ID:
+        state_note += "; it was already disabled"
+    else:
+        state_note += f"; previous target was <#{previous_target}>"
+
+    task_note = " Scheduled lifecycle task was cancelled." if task_cancelled else ""
+    await finish_hybrid_command(
+        ctx,
+        f"Detached shuffle from **{event.name}** (`{event.id}`): {state_note}."
+        f"{task_note}",
     )
 
 
@@ -5907,6 +6341,73 @@ async def event_shuffle_target_list(ctx: commands.Context):
 
 
 # ===============================
+#   COMMAND: event_shuffle_list
+# ===============================
+
+@bot.hybrid_command(
+    name='event_shuffle_list',
+    description='List scheduled events and their shuffle attachment status'
+)
+async def event_shuffle_list(ctx: commands.Context):
+    """Show scheduled/active events with explicit, disabled, or auto shuffle status."""
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await finish_hybrid_command(ctx, "This command can only be used inside a server.")
+        return
+
+    if not isinstance(ctx.author, discord.Member) or not has_reliable_role(ctx.author):
+        await finish_hybrid_command(
+            ctx,
+            f"You do not have permission to view event shuffle status. "
+            f"Required role: `{RELIABLE_ROLE_NAME}`.",
+        )
+        return
+
+    try:
+        events = await guild.fetch_scheduled_events()
+    except Exception as e:
+        await finish_hybrid_command(ctx, f"Failed to fetch scheduled events: `{e}`")
+        return
+
+    visible_events = [
+        ev for ev in events
+        if ev.status in (discord.EventStatus.scheduled, discord.EventStatus.active)
+    ]
+    if not visible_events:
+        await finish_hybrid_command(ctx, "No scheduled or active events found on this server.")
+        return
+
+    fallback_time = datetime.max.replace(tzinfo=timezone.utc)
+    visible_events.sort(key=lambda ev: ev.start_time or fallback_time)
+
+    lines: list[str] = []
+    for ev in visible_events:
+        start_ts = int(ev.start_time.timestamp()) if ev.start_time else None
+        end_ts = int(ev.end_time.timestamp()) if ev.end_time else None
+        start_label = f"<t:{start_ts}:F>" if start_ts else "`unknown`"
+        end_label = f" | ends: <t:{end_ts}:F>" if end_ts else ""
+
+        voice_channel = guild.get_channel(ev.channel_id) if ev.channel_id else None
+        voice_label = voice_channel.mention if voice_channel else f"`{ev.channel_id or 'none'}`"
+
+        task = scheduled_event_tasks.get(event_occurrence_key(ev.id, ev.start_time))
+        task_label = "scheduled" if task is not None and not task.done() else "not scheduled"
+        shuffle_status = describe_event_shuffle_binding(guild, ev)
+
+        lines.append(
+            f"- **{ev.name}** (`{ev.id}`) — `{ev.status.name}`\n"
+            f"  voice: {voice_label} | starts: {start_label}{end_label}\n"
+            f"  shuffle: {shuffle_status} | task: `{task_label}`"
+        )
+
+    chunks = chunk_sdg_days_lines("**Scheduled event shuffle status**", lines)
+    for chunk in chunks:
+        await send_hybrid_response(ctx, chunk, ephemeral=True)
+
+
+# ===============================
 #   COMMAND: list_events
 # ===============================
 
@@ -5949,6 +6450,38 @@ async def list_events(ctx: commands.Context):
         lines.append(line)
 
     await ctx.send("\n\n".join(lines))
+
+
+# ===============================
+#   COMMAND: shuffle count report
+# ===============================
+
+@bot.hybrid_command(
+    name='shuffle_count_month',
+    description='Show saved MasterMind shuffle member counts for a month'
+)
+@discord.app_commands.describe(
+    month='Month in YYYY-MM format; defaults to the current month'
+)
+async def shuffle_count_month(
+    ctx: commands.Context,
+    month: str = "",
+):
+    await defer_hybrid_command(ctx)
+
+    guild = ctx.guild
+    if guild is None:
+        await send_hybrid_response(ctx, "This command can only be used inside a server.", ephemeral=True)
+        return
+
+    try:
+        header, lines = build_shuffle_count_month_lines(guild.id, month)
+    except ValueError as error:
+        await send_hybrid_response(ctx, str(error), ephemeral=True)
+        return
+
+    for chunk in chunk_sdg_days_lines(header, lines):
+        await send_hybrid_response(ctx, chunk)
 
 
 # ===============================

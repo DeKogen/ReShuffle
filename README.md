@@ -51,12 +51,16 @@ python Shuffle.py
 - `/shuffle_hot_joiners_on` - allow brand-new late joiners to be added to active shuffles; only `Товарищ` or `надежный`
 - `/shuffle_hot_joiners_off` - prevent brand-new late joiners from being added; reconnects still return; only `Товарищ` or `надежный`
 - `/shuffle_hot_joiners_status` - show the current hot-joiner setting; only `Товарищ` or `надежный`
+- `/shuffle_count_month [YYYY-MM]` - show saved MasterMind shuffle member counts for a month; defaults to the current month
 - `/schedule_event` - schedule a voice event that auto-runs a shuffled list in the command channel
 - `/schedule_event_menu` - open a modal to schedule an event
 - `/attach_event <event_id>` - attach shuffled-list automation to an existing scheduled event; the bot will not move members between voice rooms
+- `/detach_event <event_id>` - detach/disable shuffled-list automation for one scheduled event occurrence
+- `/event_shuffle_target_add <voice_channel> <target_channel>` - auto-post shuffled lists for scheduled events in a voice channel to a text channel or voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_add <voice_channel> [target_channel]` - auto-post shuffled lists for scheduled events in a voice channel; target defaults to that voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_remove <voice_channel>` - remove an auto-post target for a voice channel; only `Товарищ`
 - `/event_shuffle_target_list` - list configured scheduled-event auto-post targets; only `Товарищ`
+- `/event_shuffle_list` - list scheduled events with shuffle attachment/auto-target status; only `Товарищ`
 - `/list_events` - list scheduled server events and their IDs
 - `/voice_stats [member]` - show today, this week, and all-time voice totals for a member
 - `/voice_sessions [member] [limit]` - show recent tracked voice sessions for a member
@@ -73,6 +77,8 @@ python Shuffle.py
 - `SDG_CORE_ROLE_ID` (optional) - numeric role ID for `core`; if unset, the bot matches by role name
 - `RESHUFFLE_DATA_DIR` (optional) - writable directory for runtime state files; useful in Docker
 - `QUESTION_BANK_FILE` (optional) - path to editable JSON question list; defaults to `questions.json` in the runtime data directory
+- `MASTERMIND_SHUFFLE_CHANNEL_ID` (optional) - voice channel ID for saved MasterMind shuffle counts; defaults to `1434301778605899808`
+- `MASTERMIND_SHUFFLE_GOAL` (optional) - green-goal member count for MasterMind reports; defaults to `15`
 
 ## Voice Tracking Storage
 - Voice activity is stored in `voice_activity.sqlite3` inside the runtime data directory
@@ -81,6 +87,7 @@ python Shuffle.py
 - Guild shuffle settings, including hot-joiners and priority shuffle channels, are stored in `shuffle_settings.json` inside the runtime data directory
 - Scheduled-event auto-post targets are stored in `event_auto_shuffle_targets.json` inside the runtime data directory
 - Exclusion and hot-joiner setting operations are audited to `shuffle_admin_audit.jsonl` inside the runtime data directory
+- MasterMind shuffle member-count changes are stored in `shuffle_counts.jsonl` inside the runtime data directory
 - Voice questions are read from `questions.json`; used-question cycle state is stored in `question_state.json`
 
 ## Docker
@@ -95,4 +102,4 @@ For persistent runtime state with Docker Compose:
 docker compose up --build -d
 ```
 
-The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, scheduled-event auto-post targets, audit logs, and the SQLite voice activity database survive container recreation.
+The included `docker-compose.yml` mounts a named volume at `/data` and sets `RESHUFFLE_DATA_DIR=/data`, so `persistent_shuffle_exclusions.json`, `shuffle_settings.json`, scheduled-event auto-post targets, audit logs, `shuffle_counts.jsonl`, and the SQLite voice activity database survive container recreation.

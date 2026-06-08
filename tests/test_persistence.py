@@ -250,6 +250,60 @@ class RuntimePersistenceTests(unittest.TestCase):
                 Shuffle.event_auto_shuffle_targets.clear()
                 Shuffle.event_auto_shuffle_targets.update(original_targets)
 
+    def test_shuffle_count_progress_fills_green_by_degree(self):
+        below_goal = Shuffle.build_shuffle_count_progress(10, goal=15)
+        at_goal = Shuffle.build_shuffle_count_progress(15, goal=15)
+
+        self.assertIn("`10/15`", below_goal)
+        self.assertEqual(below_goal.count("🟩"), 10)
+        self.assertEqual(below_goal.count("⬜"), 5)
+        self.assertNotIn("🟨", below_goal)
+        self.assertIn("`15/15`", at_goal)
+        self.assertEqual(at_goal.count("🟩"), 15)
+        self.assertNotIn("🟨", at_goal)
+
+    def test_shuffle_count_records_are_jsonl_and_monthly_report_groups_updates(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original_path = Shuffle.SHUFFLE_COUNT_LOG_FILE
+            Shuffle.SHUFFLE_COUNT_LOG_FILE = os.path.join(tmp_dir, "shuffle_counts.jsonl")
+            try:
+                Shuffle.append_shuffle_count_record(
+                    guild_id=100,
+                    guild_name="Guild",
+                    voice_channel_id=Shuffle.MASTERMIND_SHUFFLE_CHANNEL_ID,
+                    voice_channel_name="MasterMind",
+                    text_channel_id=200,
+                    message_id=300,
+                    member_count=15,
+                    goal=Shuffle.MASTERMIND_SHUFFLE_GOAL,
+                )
+                Shuffle.append_shuffle_count_record(
+                    guild_id=100,
+                    guild_name="Guild",
+                    voice_channel_id=Shuffle.MASTERMIND_SHUFFLE_CHANNEL_ID,
+                    voice_channel_name="MasterMind",
+                    text_channel_id=200,
+                    message_id=300,
+                    member_count=16,
+                    goal=Shuffle.MASTERMIND_SHUFFLE_GOAL,
+                )
+
+                with open(Shuffle.SHUFFLE_COUNT_LOG_FILE, "r", encoding="utf-8") as fh:
+                    records = [json.loads(line) for line in fh]
+
+                self.assertEqual(len(records), 2)
+                self.assertEqual(records[0]["voice_channel_id"], Shuffle.MASTERMIND_SHUFFLE_CHANNEL_ID)
+                self.assertEqual(records[0]["voice_channel_name"], "MasterMind")
+                self.assertEqual(records[0]["member_count"], 15)
+                self.assertEqual(records[0]["goal"], Shuffle.MASTERMIND_SHUFFLE_GOAL)
+
+                header, lines = Shuffle.build_shuffle_count_month_lines(100)
+                self.assertIn("MasterMind shuffle counts", header)
+                self.assertIn("Shuffles: `1`", lines[0])
+                self.assertTrue(any("`16/15`" in line and "+1" in line for line in lines))
+            finally:
+                Shuffle.SHUFFLE_COUNT_LOG_FILE = original_path
+
     def test_trusted_role_default_id_is_configured(self):
         member = types.SimpleNamespace(
             guild_permissions=types.SimpleNamespace(administrator=False),
