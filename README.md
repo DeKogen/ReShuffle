@@ -57,6 +57,7 @@ python Shuffle.py
 - `/attach_event <event_id>` - attach shuffled-list automation to an existing scheduled event; the bot will not move members between voice rooms
 - `/detach_event <event_id>` - detach/disable shuffled-list automation for one scheduled event occurrence
 - `/event_shuffle_target_add <voice_channel> <target_channel>` - auto-post shuffled lists for scheduled events in a voice channel to a text channel or voice-channel chat; only `Товарищ`
+- `/event_shuffle_target_add <voice_channel> [target_channel]` - auto-post shuffled lists for scheduled events in a voice channel; target defaults to that voice-channel chat; only `Товарищ`
 - `/event_shuffle_target_remove <voice_channel>` - remove an auto-post target for a voice channel; only `Товарищ`
 - `/event_shuffle_target_list` - list configured scheduled-event auto-post targets; only `Товарищ`
 - `/event_shuffle_list` - list scheduled events with shuffle attachment/auto-target status; only `Товарищ`
